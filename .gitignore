@@ -1,0 +1,26 @@
+# Python virtual environments & bytecode
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Temporary and local environment files
+.env
+*.log
+*.wav
+*.mp3
+*.tmp
+
+# Heavy model binary weights (Keep repository lightweight for GitHub)
+# Use ./download_models.sh to fetch weights on first run
+models/*.onnx
+models/*.onnx.json
+models/*.bin
+models/*.tar.bz2
+models/sherpa-onnx-*/*
+models/piper/*
+models/vision/*
+!models/.gitkeep
