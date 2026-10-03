@@ -133,13 +133,30 @@ async def generate_speech(req: SpeechRequest):
     voice = get_piper_voice()
     if voice is not None:
         try:
+            sample_rate = getattr(getattr(voice, "config", None), "sample_rate", 22050)
             out_buf = io.BytesIO()
             with wave.open(out_buf, "wb") as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
-                wf.setframerate(getattr(getattr(voice, "config", None), "sample_rate", 22050))
-                voice.synthesize(text, wf)
-            return Response(content=out_buf.getvalue(), media_type="audio/wav")
+                wf.setframerate(sample_rate)
+                
+                # En piper-tts synthesize_stream_raw produce chunks de bytes PCM
+                if hasattr(voice, "synthesize_stream_raw"):
+                    for audio_bytes in voice.synthesize_stream_raw(text):
+                        wf.writeframes(audio_bytes)
+                else:
+                    res = voice.synthesize(text, wf)
+                    if hasattr(res, "__iter__") and not isinstance(res, (bytes, bytearray)):
+                        for chunk in res:
+                            if isinstance(chunk, bytes):
+                                wf.writeframes(chunk)
+            
+            wav_data = out_buf.getvalue()
+            # Si se generó audio real (más que solo los 44 bytes de cabecera)
+            if len(wav_data) > 44:
+                return Response(content=wav_data, media_type="audio/wav")
+            else:
+                logger.warning("Piper sintetizó 0 bytes de audio, probando fallback.")
         except Exception as e:
             logger.error(f"Error sintetizando con Piper: {e}")
 
