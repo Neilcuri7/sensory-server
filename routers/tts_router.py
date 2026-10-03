@@ -134,24 +134,18 @@ async def generate_speech(req: SpeechRequest):
     if voice is not None:
         try:
             sample_rate = getattr(getattr(voice, "config", None), "sample_rate", 22050)
-            out_buf = io.BytesIO()
-            with wave.open(out_buf, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(sample_rate)
-                
-                # PiperVoice.synthesize(text, wav_file, ...) espera wav_file como parámetro
-                # o synthesize_stream_raw(text)
-                if hasattr(voice, "synthesize_stream_raw"):
-                    for audio_bytes in voice.synthesize_stream_raw(text):
-                        wf.writeframes(audio_bytes)
-                else:
-                    voice.synthesize(text, wav_file=wf)
+            audio_frames = bytearray()
             
-            wav_data = out_buf.getvalue()
-            # Si se generó audio real (más que solo los 44 bytes de cabecera)
-            if len(wav_data) > 44:
-                return Response(content=wav_data, media_type="audio/wav")
+            # Piper retorna un Iterable[AudioChunk] con audio_int16_bytes
+            for chunk in voice.synthesize(text):
+                if hasattr(chunk, "audio_int16_bytes"):
+                    audio_frames.extend(chunk.audio_int16_bytes)
+                elif isinstance(chunk, bytes):
+                    audio_frames.extend(chunk)
+            
+            if len(audio_frames) > 0:
+                wav_bytes = _generate_wav_bytes(bytes(audio_frames), sample_rate=sample_rate)
+                return Response(content=wav_bytes, media_type="audio/wav")
             else:
                 logger.warning("Piper sintetizó 0 bytes de audio, probando fallback.")
         except Exception as e:
