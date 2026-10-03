@@ -129,15 +129,42 @@ async def generate_speech(req: SpeechRequest):
     if not text:
         raise HTTPException(status_code=400, detail="Texto de entrada vacío.")
 
-    # 1. Intentar con Piper TTS
+    preferred_engine = (req.model or "piper").lower()
+    voice_name = req.voice or "es-ES-ElviraNeural"
+
+    # 1. Si el motor preferido es Edge-TTS (o se especificó una voz neural de Edge)
+    if "edge" in preferred_engine or "neural" in voice_name.lower():
+        try:
+            import edge_tts
+            communicate = edge_tts.Communicate(text, voice=voice_name)
+            audio_stream = io.BytesIO()
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    audio_stream.write(chunk["data"])
+            audio_bytes = audio_stream.getvalue()
+            if len(audio_bytes) > 0:
+                return Response(content=audio_bytes, media_type="audio/mpeg")
+        except Exception as e:
+            logger.warning(f"Edge-TTS falló, intentando con Piper: {e}")
+
+    # 2. Intentar con Piper TTS (Voz femenina por defecto: speaker_id=1)
     voice = get_piper_voice()
     if voice is not None:
         try:
+            from piper.config import SynthesisConfig
+            
+            # Speaker 1 es femenino ('F') en el modelo es_ES-sharvard-medium
+            speaker_id = 1
+            if req.voice and req.voice.isdigit():
+                speaker_id = int(req.voice)
+            elif req.voice and req.voice.lower() in ("m", "male", "masculino", "0"):
+                speaker_id = 0
+            
+            syn_cfg = SynthesisConfig(speaker_id=speaker_id)
             sample_rate = getattr(getattr(voice, "config", None), "sample_rate", 22050)
             audio_frames = bytearray()
             
-            # Piper retorna un Iterable[AudioChunk] con audio_int16_bytes
-            for chunk in voice.synthesize(text):
+            for chunk in voice.synthesize(text, syn_config=syn_cfg):
                 if hasattr(chunk, "audio_int16_bytes"):
                     audio_frames.extend(chunk.audio_int16_bytes)
                 elif isinstance(chunk, bytes):
@@ -151,7 +178,7 @@ async def generate_speech(req: SpeechRequest):
         except Exception as e:
             logger.error(f"Error sintetizando con Piper: {e}")
 
-    # 2. Fallback con Edge-TTS si está instalado
+    # 3. Fallback con Edge-TTS general
     try:
         import edge_tts
         communicate = edge_tts.Communicate(text, voice="es-ES-ElviraNeural")
@@ -159,11 +186,13 @@ async def generate_speech(req: SpeechRequest):
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
                 audio_stream.write(chunk["data"])
-        return Response(content=audio_stream.getvalue(), media_type="audio/mpeg")
+        audio_bytes = audio_stream.getvalue()
+        if len(audio_bytes) > 0:
+            return Response(content=audio_bytes, media_type="audio/mpeg")
     except Exception as e:
         logger.warning(f"Edge-TTS fallback no disponible: {e}")
 
-    # 3. Fallback dummy silence si no hay motor instalado
+    # 4. Fallback dummy silence si no hay motor instalado
     silent_wav = _generate_wav_bytes(b"\x00" * 4410, sample_rate=22050)
     return Response(content=silent_wav, media_type="audio/wav")
 
