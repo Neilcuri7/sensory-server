@@ -140,16 +140,13 @@ async def generate_speech(req: SpeechRequest):
                 wf.setsampwidth(2)
                 wf.setframerate(sample_rate)
                 
-                # En piper-tts synthesize_stream_raw produce chunks de bytes PCM
+                # PiperVoice.synthesize(text, wav_file, ...) espera wav_file como parámetro
+                # o synthesize_stream_raw(text)
                 if hasattr(voice, "synthesize_stream_raw"):
                     for audio_bytes in voice.synthesize_stream_raw(text):
                         wf.writeframes(audio_bytes)
                 else:
-                    res = voice.synthesize(text, wf)
-                    if hasattr(res, "__iter__") and not isinstance(res, (bytes, bytearray)):
-                        for chunk in res:
-                            if isinstance(chunk, bytes):
-                                wf.writeframes(chunk)
+                    voice.synthesize(text, wav_file=wf)
             
             wav_data = out_buf.getvalue()
             # Si se generó audio real (más que solo los 44 bytes de cabecera)
