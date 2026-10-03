@@ -9,6 +9,14 @@ pkgs.mkShell {
     onnxruntime
     libsndfile
     stdenv.cc.cc.lib
+    libGL
+    libGLU
+    glib
+    xorg.libxcb
+    xorg.libX11
+    xorg.libXext
+    xorg.libXrender
+    zlib
   ];
 
   shellHook = ''
@@ -17,6 +25,13 @@ pkgs.mkShell {
       pkgs.libsndfile
       pkgs.onnxruntime
       pkgs.zlib
+      pkgs.libGL
+      pkgs.libGLU
+      pkgs.glib
+      pkgs.xorg.libxcb
+      pkgs.xorg.libX11
+      pkgs.xorg.libXext
+      pkgs.xorg.libXrender
     ]}:$LD_LIBRARY_PATH"
 
     if [ ! -d ".venv" ]; then
