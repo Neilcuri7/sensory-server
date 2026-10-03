@@ -135,6 +135,9 @@ async def generate_speech(req: SpeechRequest):
         try:
             out_buf = io.BytesIO()
             with wave.open(out_buf, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(getattr(getattr(voice, "config", None), "sample_rate", 22050))
                 voice.synthesize(text, wf)
             return Response(content=out_buf.getvalue(), media_type="audio/wav")
         except Exception as e:
