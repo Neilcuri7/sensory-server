@@ -1,5 +1,5 @@
 """
-TTS Router: Síntesis de Voz OpenAI-compatible (Piper ONNX / Kokoro / Edge-TTS).
+TTS Router: Síntesis de Voz 100% Local (Piper ONNX / Kokoro). Exclusivamente voces femeninas.
 """
 import os
 import io
@@ -21,6 +21,8 @@ PIPER_DIR = os.path.join(MODELS_DIR, "piper")
 PIPER_ES_MODEL = os.path.join(PIPER_DIR, "es_ES-sharvard-medium.onnx")
 PIPER_ES_CONFIG = os.path.join(PIPER_DIR, "es_ES-sharvard-medium.onnx.json")
 
+KOKORO_DIR = os.path.join(MODELS_DIR, "kokoro")
+
 piper_voice = None
 kokoro_voice = None
 
@@ -41,18 +43,54 @@ def get_piper_voice():
     return None
 
 
+def get_kokoro_voice():
+    global kokoro_voice
+    if kokoro_voice is not None:
+        return kokoro_voice
+    try:
+        from kokoro_onnx import Kokoro
+        model_path = os.path.join(KOKORO_DIR, "kokoro-v1.0.int8.onnx")
+        if not os.path.exists(model_path):
+            model_path = os.path.join(KOKORO_DIR, "kokoro-v1.0.onnx")
+        voices_path = os.path.join(KOKORO_DIR, "voices-v1.0.bin")
+        if os.path.exists(model_path) and os.path.exists(voices_path):
+            kokoro_voice = Kokoro(model_path, voices_path)
+            logger.info("Motor Kokoro ONNX inicializado con éxito.")
+            return kokoro_voice
+    except Exception as e:
+        logger.warning(f"Kokoro ONNX no disponible: {e}")
+    return None
+
+
+# Mapeo de voces Kokoro exclusivamente femeninas y su idioma respectivo
+KOKORO_FEMALE_VOICES: Dict[str, str] = {
+    "ef_dora": "es",
+    "af_heart": "en-us",
+    "af_bella": "en-us",
+    "af_sarah": "en-us",
+    "af_nicole": "en-us",
+    "af_sky": "en-us",
+    "bf_emma": "en-gb",
+    "bf_isabella": "en-gb",
+    "jf_alpha": "ja",
+    "jf_gongitsune": "ja",
+    "jf_nezumi": "ja",
+    "jf_tebukuro": "ja"
+}
+
+
 class SpeechRequest(BaseModel):
-    model: Optional[str] = Field(default="piper", description="Motor o modelo de voz ('piper', 'kokoro', 'edge-tts').")
+    model: Optional[str] = Field(default="kokoro", description="Motor o modelo de voz ('kokoro', 'piper').")
     input: str = Field(..., description="Texto a sintetizar.")
-    voice: Optional[str] = Field(default="es_ES-sharvard-medium", description="Voz seleccionada.")
-    response_format: Optional[str] = Field(default="wav", description="Formato de salida ('wav', 'mp3').")
+    voice: Optional[str] = Field(default="ef_dora", description="Voz seleccionada (100% local femenina).")
+    response_format: Optional[str] = Field(default="wav", description="Formato de salida ('wav').")
     speed: Optional[float] = Field(default=1.0, description="Velocidad de reproducción (0.25 a 4.0).")
 
 
 class HealthResponse(BaseModel):
     status: str = "ok"
-    default_engine: str = "piper"
-    active_engine: str = "piper"
+    default_engine: str = "kokoro"
+    active_engine: str = "kokoro"
     piper_ready: bool = False
     kokoro_ready: bool = False
 
@@ -129,70 +167,78 @@ async def generate_speech(req: SpeechRequest):
     if not text:
         raise HTTPException(status_code=400, detail="Texto de entrada vacío.")
 
-    preferred_engine = (req.model or "piper").lower()
-    voice_name = req.voice or "es-ES-ElviraNeural"
+    preferred_engine = (req.model or "kokoro").lower()
+    voice_name = (req.voice or "ef_dora").strip()
+    user_speed = max(0.5, min(2.0, float(req.speed or 1.0)))
 
-    # 1. Si el motor preferido es Edge-TTS (o se especificó una voz neural de Edge)
-    if "edge" in preferred_engine or "neural" in voice_name.lower():
-        try:
-            import edge_tts
-            communicate = edge_tts.Communicate(text, voice=voice_name)
-            audio_stream = io.BytesIO()
-            async for chunk in communicate.stream():
-                if chunk["type"] == "audio":
-                    audio_stream.write(chunk["data"])
-            audio_bytes = audio_stream.getvalue()
-            if len(audio_bytes) > 0:
-                return Response(content=audio_bytes, media_type="audio/mpeg")
-        except Exception as e:
-            logger.warning(f"Edge-TTS falló, intentando con Piper: {e}")
+    # Determinar si la solicitud apunta explícitamente a Piper
+    is_piper_request = (
+        preferred_engine == "piper"
+        or voice_name in ("piper_f", "piper_sharvard_f", "es_ES-sharvard-medium", "1", "sharvard")
+    )
 
-    # 2. Intentar con Piper TTS (Voz femenina por defecto: speaker_id=1)
+    # 1. Síntesis con Kokoro ONNX (si no se pide explícitamente Piper)
+    if not is_piper_request:
+        kokoro = get_kokoro_voice()
+        if kokoro is not None:
+            try:
+                # Normalización a voces femeninas permitidas de Kokoro
+                target_kokoro_voice = voice_name if voice_name in KOKORO_FEMALE_VOICES else "ef_dora"
+                lang = KOKORO_FEMALE_VOICES.get(target_kokoro_voice)
+                if not lang:
+                    if target_kokoro_voice.startswith("ef_"):
+                        lang = "es"
+                    elif target_kokoro_voice.startswith("af_"):
+                        lang = "en-us"
+                    elif target_kokoro_voice.startswith("bf_"):
+                        lang = "en-gb"
+                    elif target_kokoro_voice.startswith("jf_"):
+                        lang = "ja"
+                    else:
+                        lang = "es"
+
+                samples, sample_rate = kokoro.create(
+                    text,
+                    voice=target_kokoro_voice,
+                    speed=user_speed,
+                    lang=lang
+                )
+                wav_bytes = _write_wav_bytes(samples, sample_rate=sample_rate)
+                return Response(content=wav_bytes, media_type="audio/wav")
+            except Exception as e:
+                logger.warning(f"Kokoro ONNX falló durante síntesis, probando Piper como fallback: {e}")
+
+    # 2. Síntesis 100% Local con Piper TTS (Voz femenina: speaker_id=1 'F' con ajuste real de speed)
     voice = get_piper_voice()
     if voice is not None:
         try:
             from piper.config import SynthesisConfig
-            
-            # Speaker 1 es femenino ('F') en el modelo es_ES-sharvard-medium
-            speaker_id = 1
-            if req.voice and req.voice.isdigit():
-                speaker_id = int(req.voice)
-            elif req.voice and req.voice.lower() in ("m", "male", "masculino", "0"):
-                speaker_id = 0
-            
-            syn_cfg = SynthesisConfig(speaker_id=speaker_id)
+
+            # En Piper ONNX, length_scale es el inverso de la velocidad (mayor length_scale = audio más lento)
+            length_scale = 1.0 / user_speed
+            try:
+                syn_cfg = SynthesisConfig(speaker_id=1, length_scale=length_scale)
+            except (TypeError, ValueError):
+                syn_cfg = SynthesisConfig(speaker_id=1)
+
             sample_rate = getattr(getattr(voice, "config", None), "sample_rate", 22050)
             audio_frames = bytearray()
-            
+
             for chunk in voice.synthesize(text, syn_config=syn_cfg):
                 if hasattr(chunk, "audio_int16_bytes"):
                     audio_frames.extend(chunk.audio_int16_bytes)
                 elif isinstance(chunk, bytes):
                     audio_frames.extend(chunk)
-            
+
             if len(audio_frames) > 0:
                 wav_bytes = _generate_wav_bytes(bytes(audio_frames), sample_rate=sample_rate)
                 return Response(content=wav_bytes, media_type="audio/wav")
             else:
-                logger.warning("Piper sintetizó 0 bytes de audio, probando fallback.")
+                logger.warning("Piper sintetizó 0 bytes de audio, generando respaldo silencioso.")
         except Exception as e:
             logger.error(f"Error sintetizando con Piper: {e}")
 
-    # 3. Fallback con Edge-TTS general
-    try:
-        import edge_tts
-        communicate = edge_tts.Communicate(text, voice="es-ES-ElviraNeural")
-        audio_stream = io.BytesIO()
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                audio_stream.write(chunk["data"])
-        audio_bytes = audio_stream.getvalue()
-        if len(audio_bytes) > 0:
-            return Response(content=audio_bytes, media_type="audio/mpeg")
-    except Exception as e:
-        logger.warning(f"Edge-TTS fallback no disponible: {e}")
-
-    # 4. Fallback dummy silence si no hay motor instalado
+    # 3. Fallback dummy silence 100% local si ningún motor está listo
     silent_wav = _generate_wav_bytes(b"\x00" * 4410, sample_rate=22050)
     return Response(content=silent_wav, media_type="audio/wav")
 
@@ -201,8 +247,10 @@ async def generate_speech(req: SpeechRequest):
 async def list_voices():
     return {
         "voices": [
-            {"id": "es_ES-sharvard-medium", "name": "Sharvard (Piper ES)", "language": "es"},
-            {"id": "es-ES-ElviraNeural", "name": "Elvira (Edge Neural)", "language": "es"},
-            {"id": "ef_dora", "name": "Dora (Kokoro ES)", "language": "es"}
+            {"id": "ef_dora", "name": "🌸 Dora (Kokoro Local - Español Femenino)", "language": "es", "gender": "female"},
+            {"id": "piper_f", "name": "⚡ Sharvard (Piper Local - Español Femenino)", "language": "es", "gender": "female"},
+            {"id": "af_heart", "name": "🇺🇸 Heart (Kokoro Local - Inglés Femenino)", "language": "en", "gender": "female"},
+            {"id": "af_bella", "name": "🇺🇸 Bella (Kokoro Local - Inglés Femenino)", "language": "en", "gender": "female"},
+            {"id": "jf_alpha", "name": "🇯🇵 Alpha (Kokoro Local - Japonés Femenino)", "language": "ja", "gender": "female"}
         ]
     }

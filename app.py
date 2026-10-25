@@ -62,8 +62,8 @@ async def health_check():
         "port": 8888,
         "modules": {
             "stt": "Sherpa-ONNX / Whisper-Base",
-            "tts": "Piper ONNX / Kokoro / Edge-TTS",
-            "vision": "Qwen2-VL",
+            "tts": "Kokoro ONNX / Piper ONNX (100% Local Female Voices)",
+            "vision": "RapidOCR ONNX UI Grounding",
             "ocr": "RapidOCR ONNX"
         }
     }

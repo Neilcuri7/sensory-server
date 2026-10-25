@@ -22,5 +22,6 @@ models/*.bin
 models/*.tar.bz2
 models/sherpa-onnx-*/*
 models/piper/*
+models/kokoro/*
 models/vision/*
 !models/.gitkeep

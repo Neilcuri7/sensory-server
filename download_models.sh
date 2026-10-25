@@ -40,6 +40,20 @@ else
     echo "✅ Piper Voice ya está instalado."
 fi
 
+# 3. Modelo TTS: Kokoro v1.0 ONNX Multilingüe (~88 MB int8 + ~27 MB voices)
+mkdir -p "$MODELS_DIR/kokoro"
+KOKORO_DIR="$MODELS_DIR/kokoro"
+if [ ! -f "$KOKORO_DIR/kokoro-v1.0.int8.onnx" ]; then
+    echo "🌸 Descargando Kokoro v1.0 ONNX (int8)..."
+    curl -L --progress-bar -o "$KOKORO_DIR/kokoro-v1.0.int8.onnx" \
+        "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.int8.onnx"
+    curl -L --progress-bar -o "$KOKORO_DIR/voices-v1.0.bin" \
+        "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
+    echo "✅ Kokoro v1.0 ONNX listo."
+else
+    echo "✅ Kokoro v1.0 ONNX ya está instalado."
+fi
+
 echo "=========================================================="
 echo "✨ Todos los modelos sensoriales están listos en $MODELS_DIR"
 echo "=========================================================="
