@@ -5,23 +5,51 @@ en un único proceso FastAPI de alta eficiencia y bajo consumo de memoria.
 Puerto por defecto: 8888
 """
 import os
+import time
+import uuid
 import logging
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from routers.stt_router import router as stt_router
 from routers.tts_router import router as tts_router
 from routers.vision_router import router as vision_router
 from routers.ocr_router import router as ocr_router
 
+log_level_name = os.getenv("AOI_SENSORY_LOG_LEVEL", "INFO").upper()
+log_level = getattr(logging, log_level_name, logging.INFO)
 logging.basicConfig(
-    level=logging.INFO,
+    level=log_level,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("Aoi.SensoryHub")
+
+
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    """Middleware que registra latencia, método, ruta, IP y X-Request-ID en cada petición."""
+    async def dispatch(self, request: Request, call_next):
+        req_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+        start_time = time.perf_counter()
+        client_ip = request.client.host if request.client else "unknown"
+
+        response = await call_next(request)
+
+        duration_ms = (time.perf_counter() - start_time) * 1000.0
+        response.headers["X-Request-ID"] = req_id
+
+        # No saturar logs en requests periódicos de healthcheck salvo si hay error
+        if request.url.path == "/health" and response.status_code == 200:
+            logger.debug(f"[{req_id}] GET /health - 200 ({duration_ms:.1f}ms) [client={client_ip}]")
+        else:
+            logger.info(
+                f"[{req_id}] {request.method} {request.url.path} - {response.status_code} "
+                f"({duration_ms:.1f}ms) [client={client_ip}]"
+            )
+        return response
 
 
 @asynccontextmanager
@@ -59,6 +87,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(RequestLoggingMiddleware)
 
 # Montar todos los routers sensoriales
 app.include_router(stt_router)
@@ -69,10 +98,29 @@ app.include_router(ocr_router)
 
 @app.get("/health")
 async def health_check():
+    import routers.stt_router as stt_mod
+    import routers.tts_router as tts_mod
+
+    stt_loaded = getattr(stt_mod, "recognizer", None) is not None
+    kokoro_loaded = getattr(tts_mod, "kokoro_voice", None) is not None
+    piper_loaded = getattr(tts_mod, "piper_voice", None) is not None
+
+    if stt_loaded and kokoro_loaded and piper_loaded:
+        health_status = "healthy"
+    elif stt_loaded or kokoro_loaded or piper_loaded:
+        health_status = "degraded"
+    else:
+        health_status = "down"
+
     return {
-        "status": "healthy",
+        "status": health_status,
         "service": "aoi-sensory-hub",
         "port": 8888,
+        "models": {
+            "stt": stt_loaded,
+            "kokoro": kokoro_loaded,
+            "piper": piper_loaded
+        },
         "modules": {
             "stt": "Sherpa-ONNX / Whisper-Base",
             "tts": "Kokoro ONNX / Piper ONNX (100% Local Female Voices)",

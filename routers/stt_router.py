@@ -4,6 +4,7 @@ Ejecución asíncrona no bloqueante (threading) para alta concurrencia.
 """
 import os
 import io
+import time
 import logging
 import threading
 import asyncio
@@ -59,19 +60,24 @@ class TranscriptionResponse(BaseModel):
     text: str
 
 
-def _transcribe_bytes_sync(audio_bytes: bytes) -> str:
+def _transcribe_bytes_sync(audio_bytes: bytes) -> tuple[str, dict]:
     """Función de transcripción síncrona thread-safe protegida por _stt_lock."""
+    t_wait_start = time.perf_counter()
     with _stt_lock:
+        lock_wait_ms = (time.perf_counter() - t_wait_start) * 1000.0
         rec = get_recognizer()
         if rec is None:
-            return "[STT Service Ready]"
+            raise RuntimeError("STT model not loaded or unavailable")
 
+        t_infer_start = time.perf_counter()
         audio_file = io.BytesIO(audio_bytes)
         data, sample_rate = sf.read(audio_file, dtype="float32")
 
         # Convertir a mono si es estéreo
         if len(data.shape) > 1:
             data = np.mean(data, axis=1)
+
+        raw_duration_sec = len(data) / float(sample_rate) if sample_rate > 0 else 0.0
 
         # Resamplear a 16kHz si es necesario
         if sample_rate != 16000:
@@ -83,7 +89,21 @@ def _transcribe_bytes_sync(audio_bytes: bytes) -> str:
         stream = rec.create_stream()
         stream.accept_waveform(sample_rate, data)
         rec.decode_stream(stream)
-        return stream.result.text.strip()
+        text = stream.result.text.strip()
+
+        infer_duration_sec = time.perf_counter() - t_infer_start
+        rtf = (infer_duration_sec / raw_duration_sec) if raw_duration_sec > 0 else 0.0
+
+        metrics = {
+            "bytes": len(audio_bytes),
+            "sample_rate": sample_rate,
+            "duration_sec": raw_duration_sec,
+            "lock_wait_ms": lock_wait_ms,
+            "infer_ms": infer_duration_sec * 1000.0,
+            "rtf": rtf,
+            "text_len": len(text)
+        }
+        return text, metrics
 
 
 @router.post("/v1/audio/transcriptions", response_model=TranscriptionResponse)
@@ -98,7 +118,18 @@ async def transcribe_audio(
         if not audio_bytes:
             raise HTTPException(status_code=400, detail="Archivo de audio vacío.")
 
-        text = await asyncio.to_thread(_transcribe_bytes_sync, audio_bytes)
+        try:
+            text, metrics = await asyncio.to_thread(_transcribe_bytes_sync, audio_bytes)
+        except RuntimeError as r_err:
+            logger.error(f"⚠️ [STT Unavailable] {r_err}")
+            raise HTTPException(status_code=503, detail=str(r_err))
+
+        logger.info(
+            f"🎙️ [STT Ingest] {metrics['bytes']}B, {metrics['sample_rate']}Hz, "
+            f"{metrics['duration_sec']:.2f}s audio | lock_wait={metrics['lock_wait_ms']:.1f}ms, "
+            f"infer={metrics['infer_ms']:.1f}ms (RTF={metrics['rtf']:.2f}) | "
+            f"text_len={metrics['text_len']}: '{text[:60]}'"
+        )
         return TranscriptionResponse(text=text)
     except HTTPException:
         raise

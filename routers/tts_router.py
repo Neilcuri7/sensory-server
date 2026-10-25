@@ -5,6 +5,7 @@ Exclusivamente voces femeninas con ejecución asíncrona no bloqueante (threadin
 import os
 import io
 import re
+import time
 import wave
 import logging
 import threading
@@ -195,62 +196,105 @@ def _generate_wav_bytes(audio_data: bytes, sample_rate: int = 22050) -> bytes:
     return out.getvalue()
 
 
-def _synthesize_wav_sync(text: str, voice_id: str, speed: float) -> bytes:
+def _synthesize_wav_sync(text: str, voice_id: str, speed: float) -> tuple[bytes, dict]:
     """Función de síntesis síncrona thread-safe protegida por _tts_lock."""
+    t_wait_start = time.perf_counter()
     with _tts_lock:
+        lock_wait_ms = (time.perf_counter() - t_wait_start) * 1000.0
         clean_text = _sanitize_text_for_tts(text)
+        chars = len(clean_text)
         if not clean_text:
-            return _generate_wav_bytes(b"\x00" * 4410, sample_rate=22050)
+            dummy = _generate_wav_bytes(b"\x00" * 4410, sample_rate=22050)
+            metrics = {
+                "voice": voice_id,
+                "engine": "empty",
+                "lang": "none",
+                "chars": 0,
+                "lock_wait_ms": lock_wait_ms,
+                "infer_ms": 0.0,
+                "audio_dur_ms": 100.0,
+                "bytes": len(dummy)
+            }
+            return dummy, metrics
 
         user_speed = max(0.5, min(2.0, float(speed)))
         is_piper = voice_id in ("piper_f", "piper_sharvard_f", "es_ES-sharvard-medium", "1", "sharvard")
+
+        target_voice = voice_id if voice_id in KOKORO_FEMALE_VOICES else "ef_dora"
+        detected_lang = _detect_phoneme_lang(clean_text, target_voice) if not is_piper else "es"
+        engine_used = "fallback"
+
+        t_infer_start = time.perf_counter()
+        wav_bytes = None
 
         # 1. Kokoro ONNX (si no es explícitamente Piper)
         if not is_piper:
             kokoro = get_kokoro_voice()
             if kokoro is not None:
                 try:
-                    target_voice = voice_id if voice_id in KOKORO_FEMALE_VOICES else "ef_dora"
-                    lang = _detect_phoneme_lang(clean_text, target_voice)
                     samples, sample_rate = kokoro.create(
                         clean_text,
                         voice=target_voice,
                         speed=user_speed,
-                        lang=lang
+                        lang=detected_lang
                     )
-                    return _write_wav_bytes(samples, sample_rate=sample_rate)
+                    wav_bytes = _write_wav_bytes(samples, sample_rate=sample_rate)
+                    engine_used = "kokoro"
                 except Exception as e:
                     logger.warning(f"Kokoro ONNX falló durante síntesis, probando Piper como fallback: {e}")
 
         # 2. Piper TTS (100% Local - Femenino speaker_id=1 con control real de speed)
-        voice = get_piper_voice()
-        if voice is not None:
-            try:
-                from piper.config import SynthesisConfig
-                length_scale = 1.0 / user_speed
+        if wav_bytes is None:
+            voice = get_piper_voice()
+            if voice is not None:
                 try:
-                    syn_cfg = SynthesisConfig(speaker_id=1, length_scale=length_scale)
-                except (TypeError, ValueError):
-                    syn_cfg = SynthesisConfig(speaker_id=1)
+                    from piper.config import SynthesisConfig
+                    length_scale = 1.0 / user_speed
+                    try:
+                        syn_cfg = SynthesisConfig(speaker_id=1, length_scale=length_scale)
+                    except (TypeError, ValueError):
+                        syn_cfg = SynthesisConfig(speaker_id=1)
 
-                sample_rate = getattr(getattr(voice, "config", None), "sample_rate", 22050)
-                audio_frames = bytearray()
+                    sample_rate = getattr(getattr(voice, "config", None), "sample_rate", 22050)
+                    audio_frames = bytearray()
 
-                for chunk in voice.synthesize(clean_text, syn_config=syn_cfg):
-                    if hasattr(chunk, "audio_int16_bytes"):
-                        audio_frames.extend(chunk.audio_int16_bytes)
-                    elif isinstance(chunk, bytes):
-                        audio_frames.extend(chunk)
+                    for chunk in voice.synthesize(clean_text, syn_config=syn_cfg):
+                        if hasattr(chunk, "audio_int16_bytes"):
+                            audio_frames.extend(chunk.audio_int16_bytes)
+                        elif isinstance(chunk, bytes):
+                            audio_frames.extend(chunk)
 
-                if len(audio_frames) > 0:
-                    return _generate_wav_bytes(bytes(audio_frames), sample_rate=sample_rate)
-                else:
-                    logger.warning("Piper sintetizó 0 bytes de audio, generando silencio.")
-            except Exception as e:
-                logger.error(f"Error sintetizando con Piper: {e}")
+                    if len(audio_frames) > 0:
+                        wav_bytes = _generate_wav_bytes(bytes(audio_frames), sample_rate=sample_rate)
+                        engine_used = "piper"
+                    else:
+                        logger.warning("Piper sintetizó 0 bytes de audio, generando silencio.")
+                except Exception as e:
+                    logger.error(f"Error sintetizando con Piper: {e}")
 
         # 3. Fallback dummy silence si ningún motor está listo
-        return _generate_wav_bytes(b"\x00" * 4410, sample_rate=22050)
+        if wav_bytes is None:
+            wav_bytes = _generate_wav_bytes(b"\x00" * 4410, sample_rate=22050)
+            engine_used = "fallback"
+
+        infer_ms = (time.perf_counter() - t_infer_start) * 1000.0
+
+        audio_dur_ms = 0.0
+        if len(wav_bytes) > 44:
+            sr = 24000 if engine_used == "kokoro" else 22050
+            audio_dur_ms = ((len(wav_bytes) - 44) / (sr * 2)) * 1000.0
+
+        metrics = {
+            "voice": voice_id,
+            "engine": engine_used,
+            "lang": detected_lang,
+            "chars": chars,
+            "lock_wait_ms": lock_wait_ms,
+            "infer_ms": infer_ms,
+            "audio_dur_ms": audio_dur_ms,
+            "bytes": len(wav_bytes)
+        }
+        return wav_bytes, metrics
 
 
 @router.post("/v1/audio/speech")
@@ -263,11 +307,16 @@ async def generate_speech(req: SpeechRequest):
     if (req.model or "").lower() == "piper" and voice_id not in ("piper_f", "piper_sharvard_f"):
         voice_id = "piper_f"
 
-    wav_bytes = await asyncio.to_thread(
+    wav_bytes, metrics = await asyncio.to_thread(
         _synthesize_wav_sync,
         text,
         voice_id,
         float(req.speed or 1.0)
+    )
+    logger.info(
+        f"🔊 [TTS Synthesis] voice='{metrics['voice']}' ({metrics['engine']}), lang='{metrics['lang']}', "
+        f"chars={metrics['chars']} | lock_wait={metrics['lock_wait_ms']:.1f}ms, "
+        f"infer={metrics['infer_ms']:.1f}ms | audio_dur={metrics['audio_dur_ms']:.0f}ms ({metrics['bytes']}B)"
     )
     return Response(content=wav_bytes, media_type="audio/wav")
 
