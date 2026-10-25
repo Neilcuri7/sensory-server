@@ -1,11 +1,12 @@
 """
 STT Router: Transcripción de Audio OpenAI-compatible (Sherpa-ONNX / Whisper).
+Ejecución asíncrona no bloqueante (threading) para alta concurrencia.
 """
 import os
 import io
-import re
-import sys
 import logging
+import threading
+import asyncio
 from typing import Optional
 
 import numpy as np
@@ -23,6 +24,7 @@ WHISPER_BASE_DECODER = os.path.join(WHISPER_BASE_DIR, "base-decoder.int8.onnx")
 WHISPER_BASE_TOKENS = os.path.join(WHISPER_BASE_DIR, "base-tokens.txt")
 
 recognizer = None
+_stt_lock = threading.Lock()
 
 
 def get_recognizer():
@@ -57,22 +59,12 @@ class TranscriptionResponse(BaseModel):
     text: str
 
 
-@router.post("/v1/audio/transcriptions", response_model=TranscriptionResponse)
-async def transcribe_audio(
-    file: UploadFile = File(...),
-    model: Optional[str] = Form(default="whisper-base"),
-    language: Optional[str] = Form(default="es"),
-    temperature: Optional[float] = Form(default=0.0)
-):
-    try:
-        audio_bytes = await file.read()
-        if not audio_bytes:
-            raise HTTPException(status_code=400, detail="Archivo de audio vacío.")
-
+def _transcribe_bytes_sync(audio_bytes: bytes) -> str:
+    """Función de transcripción síncrona thread-safe protegida por _stt_lock."""
+    with _stt_lock:
         rec = get_recognizer()
         if rec is None:
-            # Fallback en caso de que el modelo aún no esté listo
-            return TranscriptionResponse(text="[STT Service Ready]")
+            return "[STT Service Ready]"
 
         audio_file = io.BytesIO(audio_bytes)
         data, sample_rate = sf.read(audio_file, dtype="float32")
@@ -91,8 +83,22 @@ async def transcribe_audio(
         stream = rec.create_stream()
         stream.accept_waveform(sample_rate, data)
         rec.decode_stream(stream)
-        text = stream.result.text.strip()
+        return stream.result.text.strip()
 
+
+@router.post("/v1/audio/transcriptions", response_model=TranscriptionResponse)
+async def transcribe_audio(
+    file: UploadFile = File(...),
+    model: Optional[str] = Form(default="whisper-base"),
+    language: Optional[str] = Form(default="es"),
+    temperature: Optional[float] = Form(default=0.0)
+):
+    try:
+        audio_bytes = await file.read()
+        if not audio_bytes:
+            raise HTTPException(status_code=400, detail="Archivo de audio vacío.")
+
+        text = await asyncio.to_thread(_transcribe_bytes_sync, audio_bytes)
         return TranscriptionResponse(text=text)
     except HTTPException:
         raise

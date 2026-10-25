@@ -1,17 +1,23 @@
 """
-TTS Router: Síntesis de Voz 100% Local (Piper ONNX / Kokoro). Exclusivamente voces femeninas.
+TTS Router: Síntesis de Voz 100% Local (Kokoro ONNX / Piper ONNX).
+Exclusivamente voces femeninas con ejecución asíncrona no bloqueante (threading).
 """
 import os
 import io
 import re
 import wave
 import logging
-from typing import Optional, List, Dict, Any
+import threading
+import asyncio
+from typing import Optional, Dict
 
 import numpy as np
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
+
+# Silenciar desalineación de palabras en phonemizer (causada por signos ¿¡ en espeak-ng)
+logging.getLogger("phonemizer").setLevel(logging.ERROR)
 
 logger = logging.getLogger("Aoi.Sensory.TTS")
 router = APIRouter(tags=["TTS"])
@@ -25,6 +31,55 @@ KOKORO_DIR = os.path.join(MODELS_DIR, "kokoro")
 
 piper_voice = None
 kokoro_voice = None
+_tts_lock = threading.Lock()
+
+# Exclusivamente voces femeninas locales soportadas
+KOKORO_FEMALE_VOICES: Dict[str, str] = {
+    "ef_dora": "es",
+    "af_heart": "en-us",
+    "af_bella": "en-us",
+    "af_sarah": "en-us",
+    "af_nicole": "en-us",
+    "af_sky": "en-us",
+    "bf_emma": "en-gb",
+    "bf_isabella": "en-gb",
+    "jf_alpha": "ja",
+    "jf_gongitsune": "ja",
+    "jf_nezumi": "ja",
+    "jf_tebukuro": "ja"
+}
+
+_SPANISH_WORD_REGEX = re.compile(
+    r'\b(el|la|los|las|de|que|en|un|una|con|para|por|como|pero|más|hola|estoy|aquí|buenas|tardes|días|noches|claro|puedo|todo|bien|gracias|qué|cómo|está|estás|soy|tienes|quieres)\b',
+    re.IGNORECASE
+)
+_JAPANESE_REGEX = re.compile(r'[\u3040-\u30ff\u4e00-\u9faf]')
+_SPANISH_CHAR_REGEX = re.compile(r'[áéíóúüñÁÉÍÓÚÜÑ]')
+
+
+def _sanitize_text_for_tts(text: str) -> str:
+    """Limpia puntuación que desincroniza el conteo de palabras en espeak-ng/phonemizer."""
+    if not text:
+        return ""
+    t = text.replace("¿", "").replace("¡", "")
+    t = t.replace("—", ", ").replace("–", ", ").replace("…", ". ").replace("...", ". ")
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t
+
+
+def _detect_phoneme_lang(text: str, voice_id: str) -> str:
+    """Detecta el idioma fonético adecuado para Kokoro ONNX evitando fallos de phonemizer."""
+    if _JAPANESE_REGEX.search(text):
+        return "ja"
+    if voice_id == "ef_dora" or _SPANISH_CHAR_REGEX.search(text) or _SPANISH_WORD_REGEX.search(text):
+        return "es"
+    if voice_id in ("af_heart", "af_bella", "af_sarah", "af_nicole", "af_sky"):
+        return "en-us"
+    if voice_id in ("bf_emma", "bf_isabella"):
+        return "en-gb"
+    if voice_id.startswith("jf_"):
+        return "ja"
+    return "es"
 
 
 def get_piper_voice():
@@ -62,23 +117,6 @@ def get_kokoro_voice():
     return None
 
 
-# Mapeo de voces Kokoro exclusivamente femeninas y su idioma respectivo
-KOKORO_FEMALE_VOICES: Dict[str, str] = {
-    "ef_dora": "es",
-    "af_heart": "en-us",
-    "af_bella": "en-us",
-    "af_sarah": "en-us",
-    "af_nicole": "en-us",
-    "af_sky": "en-us",
-    "bf_emma": "en-gb",
-    "bf_isabella": "en-gb",
-    "jf_alpha": "ja",
-    "jf_gongitsune": "ja",
-    "jf_nezumi": "ja",
-    "jf_tebukuro": "ja"
-}
-
-
 class SpeechRequest(BaseModel):
     model: Optional[str] = Field(default="kokoro", description="Motor o modelo de voz ('kokoro', 'piper').")
     input: str = Field(..., description="Texto a sintetizar.")
@@ -95,13 +133,12 @@ class HealthResponse(BaseModel):
     kokoro_ready: bool = False
 
 
-def split_sentences_for_streaming(text: str) -> List[str]:
-    """Divide un texto en oraciones/cláusulas para síntesis incremental de baja latencia."""
+def split_sentences_for_streaming(text: str) -> list[str]:
+    """Divide un texto en oraciones/cláusulas para síntesis incremental."""
     if not text:
         return []
-    # Divide preservando puntuación delimitadora (;, ., ?, !, \n)
     raw_chunks = re.split(r'([;.\?!]+|\n+)', text)
-    sentences: List[str] = []
+    sentences = []
     current = ""
     for part in raw_chunks:
         if not part:
@@ -117,10 +154,20 @@ def split_sentences_for_streaming(text: str) -> List[str]:
     return sentences
 
 
-def _write_wav_bytes(samples: np.ndarray, sample_rate: int = 16000) -> bytes:
+def _read_wav_samples(wav_bytes: bytes) -> tuple:
+    """Lee bytes de audio WAV y retorna (samples_array_float32, sample_rate)."""
+    with io.BytesIO(wav_bytes) as bio:
+        with wave.open(bio, "rb") as wf:
+            sample_rate = wf.getframerate()
+            frames = wf.readframes(wf.getnframes())
+            int_data = np.frombuffer(frames, dtype=np.int16)
+            float_data = int_data.astype(np.float32) / 32767.0
+            return float_data, sample_rate
+
+
+def _write_wav_bytes(samples: np.ndarray, sample_rate: int = 24000) -> bytes:
     """Convierte un array de samples numpy (float32 o int16) en un WAV PCM de 16 bits."""
     if samples.dtype in (np.float32, np.float64):
-        # Clip y escalar a int16
         clipped = np.clip(samples, -1.0, 1.0)
         int_data = (clipped * 32767.0).astype(np.int16)
     elif samples.dtype == np.int16:
@@ -137,20 +184,8 @@ def _write_wav_bytes(samples: np.ndarray, sample_rate: int = 16000) -> bytes:
     return out.getvalue()
 
 
-def _read_wav_samples(wav_bytes: bytes) -> tuple:
-    """Lee bytes de audio WAV y retorna (samples_array_float32, sample_rate)."""
-    with io.BytesIO(wav_bytes) as bio:
-        with wave.open(bio, "rb") as wf:
-            sample_rate = wf.getframerate()
-            frames = wf.readframes(wf.getnframes())
-            # Convertir PCM 16-bit a float32 [-1.0, 1.0]
-            int_data = np.frombuffer(frames, dtype=np.int16)
-            float_data = int_data.astype(np.float32) / 32767.0
-            return float_data, sample_rate
-
-
 def _generate_wav_bytes(audio_data: bytes, sample_rate: int = 22050) -> bytes:
-    """Genera archivo WAV estándar PCM 16-bit a partir de datos raw o array."""
+    """Genera archivo WAV estándar PCM 16-bit a partir de datos raw int16."""
     out = io.BytesIO()
     with wave.open(out, "wb") as wf:
         wf.setnchannels(1)
@@ -160,6 +195,63 @@ def _generate_wav_bytes(audio_data: bytes, sample_rate: int = 22050) -> bytes:
     return out.getvalue()
 
 
+def _synthesize_wav_sync(text: str, voice_id: str, speed: float) -> bytes:
+    """Función de síntesis síncrona thread-safe protegida por _tts_lock."""
+    with _tts_lock:
+        clean_text = _sanitize_text_for_tts(text)
+        if not clean_text:
+            return _generate_wav_bytes(b"\x00" * 4410, sample_rate=22050)
+
+        user_speed = max(0.5, min(2.0, float(speed)))
+        is_piper = voice_id in ("piper_f", "piper_sharvard_f", "es_ES-sharvard-medium", "1", "sharvard")
+
+        # 1. Kokoro ONNX (si no es explícitamente Piper)
+        if not is_piper:
+            kokoro = get_kokoro_voice()
+            if kokoro is not None:
+                try:
+                    target_voice = voice_id if voice_id in KOKORO_FEMALE_VOICES else "ef_dora"
+                    lang = _detect_phoneme_lang(clean_text, target_voice)
+                    samples, sample_rate = kokoro.create(
+                        clean_text,
+                        voice=target_voice,
+                        speed=user_speed,
+                        lang=lang
+                    )
+                    return _write_wav_bytes(samples, sample_rate=sample_rate)
+                except Exception as e:
+                    logger.warning(f"Kokoro ONNX falló durante síntesis, probando Piper como fallback: {e}")
+
+        # 2. Piper TTS (100% Local - Femenino speaker_id=1 con control real de speed)
+        voice = get_piper_voice()
+        if voice is not None:
+            try:
+                from piper.config import SynthesisConfig
+                length_scale = 1.0 / user_speed
+                try:
+                    syn_cfg = SynthesisConfig(speaker_id=1, length_scale=length_scale)
+                except (TypeError, ValueError):
+                    syn_cfg = SynthesisConfig(speaker_id=1)
+
+                sample_rate = getattr(getattr(voice, "config", None), "sample_rate", 22050)
+                audio_frames = bytearray()
+
+                for chunk in voice.synthesize(clean_text, syn_config=syn_cfg):
+                    if hasattr(chunk, "audio_int16_bytes"):
+                        audio_frames.extend(chunk.audio_int16_bytes)
+                    elif isinstance(chunk, bytes):
+                        audio_frames.extend(chunk)
+
+                if len(audio_frames) > 0:
+                    return _generate_wav_bytes(bytes(audio_frames), sample_rate=sample_rate)
+                else:
+                    logger.warning("Piper sintetizó 0 bytes de audio, generando silencio.")
+            except Exception as e:
+                logger.error(f"Error sintetizando con Piper: {e}")
+
+        # 3. Fallback dummy silence si ningún motor está listo
+        return _generate_wav_bytes(b"\x00" * 4410, sample_rate=22050)
+
 
 @router.post("/v1/audio/speech")
 async def generate_speech(req: SpeechRequest):
@@ -167,80 +259,17 @@ async def generate_speech(req: SpeechRequest):
     if not text:
         raise HTTPException(status_code=400, detail="Texto de entrada vacío.")
 
-    preferred_engine = (req.model or "kokoro").lower()
-    voice_name = (req.voice or "ef_dora").strip()
-    user_speed = max(0.5, min(2.0, float(req.speed or 1.0)))
+    voice_id = (req.voice or "ef_dora").strip()
+    if (req.model or "").lower() == "piper" and voice_id not in ("piper_f", "piper_sharvard_f"):
+        voice_id = "piper_f"
 
-    # Determinar si la solicitud apunta explícitamente a Piper
-    is_piper_request = (
-        preferred_engine == "piper"
-        or voice_name in ("piper_f", "piper_sharvard_f", "es_ES-sharvard-medium", "1", "sharvard")
+    wav_bytes = await asyncio.to_thread(
+        _synthesize_wav_sync,
+        text,
+        voice_id,
+        float(req.speed or 1.0)
     )
-
-    # 1. Síntesis con Kokoro ONNX (si no se pide explícitamente Piper)
-    if not is_piper_request:
-        kokoro = get_kokoro_voice()
-        if kokoro is not None:
-            try:
-                # Normalización a voces femeninas permitidas de Kokoro
-                target_kokoro_voice = voice_name if voice_name in KOKORO_FEMALE_VOICES else "ef_dora"
-                lang = KOKORO_FEMALE_VOICES.get(target_kokoro_voice)
-                if not lang:
-                    if target_kokoro_voice.startswith("ef_"):
-                        lang = "es"
-                    elif target_kokoro_voice.startswith("af_"):
-                        lang = "en-us"
-                    elif target_kokoro_voice.startswith("bf_"):
-                        lang = "en-gb"
-                    elif target_kokoro_voice.startswith("jf_"):
-                        lang = "ja"
-                    else:
-                        lang = "es"
-
-                samples, sample_rate = kokoro.create(
-                    text,
-                    voice=target_kokoro_voice,
-                    speed=user_speed,
-                    lang=lang
-                )
-                wav_bytes = _write_wav_bytes(samples, sample_rate=sample_rate)
-                return Response(content=wav_bytes, media_type="audio/wav")
-            except Exception as e:
-                logger.warning(f"Kokoro ONNX falló durante síntesis, probando Piper como fallback: {e}")
-
-    # 2. Síntesis 100% Local con Piper TTS (Voz femenina: speaker_id=1 'F' con ajuste real de speed)
-    voice = get_piper_voice()
-    if voice is not None:
-        try:
-            from piper.config import SynthesisConfig
-
-            # En Piper ONNX, length_scale es el inverso de la velocidad (mayor length_scale = audio más lento)
-            length_scale = 1.0 / user_speed
-            try:
-                syn_cfg = SynthesisConfig(speaker_id=1, length_scale=length_scale)
-            except (TypeError, ValueError):
-                syn_cfg = SynthesisConfig(speaker_id=1)
-
-            sample_rate = getattr(getattr(voice, "config", None), "sample_rate", 22050)
-            audio_frames = bytearray()
-
-            for chunk in voice.synthesize(text, syn_config=syn_cfg):
-                if hasattr(chunk, "audio_int16_bytes"):
-                    audio_frames.extend(chunk.audio_int16_bytes)
-                elif isinstance(chunk, bytes):
-                    audio_frames.extend(chunk)
-
-            if len(audio_frames) > 0:
-                wav_bytes = _generate_wav_bytes(bytes(audio_frames), sample_rate=sample_rate)
-                return Response(content=wav_bytes, media_type="audio/wav")
-            else:
-                logger.warning("Piper sintetizó 0 bytes de audio, generando respaldo silencioso.")
-        except Exception as e:
-            logger.error(f"Error sintetizando con Piper: {e}")
-
-    # 3. Fallback dummy silence 100% local si ningún motor está listo
-    silent_wav = _generate_wav_bytes(b"\x00" * 4410, sample_rate=22050)
-    return Response(content=silent_wav, media_type="audio/wav")
+    return Response(content=wav_bytes, media_type="audio/wav")
 
 
 @router.get("/v1/audio/voices")
