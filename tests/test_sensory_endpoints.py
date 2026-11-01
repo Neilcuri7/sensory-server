@@ -9,10 +9,12 @@ Verifica:
 """
 import os
 import io
+import time
 import wave
 import unittest
 from unittest.mock import patch, MagicMock
 from fastapi.testclient import TestClient
+import numpy as np
 
 from app import app
 import routers.stt_router as stt_router
@@ -140,6 +142,40 @@ class TestSensoryEndpoints(unittest.TestCase):
             self.assertEqual(response.headers.get("X-TTS-Voice"), "piper_f")
             _, kwargs = mock_synth.call_args
             self.assertEqual(kwargs.get("model"), "piper")
+
+    def test_anime_pitch_shift_benchmark_under_10ms(self):
+        """Verifica que _apply_anime_pitch_shift sobre 24000 muestras (1s a 24kHz) ejecute en < 10ms."""
+        sample_rate = 24000
+        # 1 segundo de audio sintético a 24kHz
+        samples = np.sin(2 * np.pi * 440 * np.linspace(0, 1, sample_rate, dtype=np.float32))
+
+        # Warm-up previo
+        tts_router._apply_anime_pitch_shift(samples, sample_rate, 2.0)
+
+        # Benchmark de ejecución
+        t_start = time.perf_counter()
+        shifted = tts_router._apply_anime_pitch_shift(samples, sample_rate, 2.0)
+        elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+
+        # Verificación de rendimiento estricto (< 10 ms)
+        self.assertLess(
+            elapsed_ms,
+            10.0,
+            f"El remuestreo tardó {elapsed_ms:.2f}ms, excediendo el límite de 10ms"
+        )
+
+        # Verificaciones de sanidad y propiedades del audio
+        expected_len = max(1, int(len(samples) / (2.0 ** (2.0 / 12.0))))
+        self.assertEqual(len(shifted), expected_len)
+        self.assertEqual(shifted.dtype, samples.dtype)
+
+        # Casos borde: tono despreciable o array vacío
+        noop = tts_router._apply_anime_pitch_shift(samples, sample_rate, 0.0)
+        np.testing.assert_array_equal(noop, samples)
+
+        empty = np.array([], dtype=np.float32)
+        empty_shifted = tts_router._apply_anime_pitch_shift(empty, sample_rate, 2.0)
+        self.assertEqual(len(empty_shifted), 0)
 
 
 if __name__ == "__main__":

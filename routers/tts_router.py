@@ -91,19 +91,13 @@ def _apply_anime_pitch_shift(
     sample_rate: int,
     pitch_semitones: float,
 ) -> np.ndarray:
-    """Aplica cambio de tono (pitch shift) en semitonos mediante remuestreo DSP de alta fidelidad."""
+    """Aplica cambio de tono (pitch shift) en semitonos mediante remuestreo ultra-rápido vectorizado en NumPy."""
     if abs(pitch_semitones) < 0.05 or len(samples) == 0:
         return samples
     factor = 2.0 ** (pitch_semitones / 12.0)
     new_length = max(1, int(len(samples) / factor))
-    try:
-        import scipy.signal
-        shifted = scipy.signal.resample(samples, new_length)
-        return shifted.astype(samples.dtype)
-    except Exception as e:
-        logger.debug(f"Aviso DSP pitch shift fallback: {e}")
-        orig_indices = np.linspace(0, len(samples) - 1, new_length)
-        return np.interp(orig_indices, np.arange(len(samples)), samples).astype(samples.dtype)
+    orig_indices = np.linspace(0, len(samples) - 1, new_length, dtype=np.float32)
+    return np.interp(orig_indices, np.arange(len(samples), dtype=np.float32), samples).astype(samples.dtype)
 
 
 def _get_elastic_session_options() -> ort.SessionOptions:
@@ -312,6 +306,8 @@ def _synthesize_wav_sync(
                 "chars": 0,
                 "lock_wait_ms": lock_wait_ms,
                 "infer_ms": 0.0,
+                "onnx_ms": 0.0,
+                "dsp_ms": 0.0,
                 "audio_dur_ms": 100.0,
                 "bytes": len(dummy)
             }
@@ -330,6 +326,8 @@ def _synthesize_wav_sync(
 
         t_infer_start = time.perf_counter()
         wav_bytes = None
+        onnx_ms = 0.0
+        dsp_ms = 0.0
 
         # Si se solicita explícitamente Piper (o voice='piper_f'): sintetizar prioritariamente con Piper
         if is_piper:
@@ -346,20 +344,24 @@ def _synthesize_wav_sync(
                     sample_rate = getattr(getattr(voice, "config", None), "sample_rate", 22050)
                     audio_frames = bytearray()
 
+                    t_onnx_start = time.perf_counter()
                     for chunk in voice.synthesize(clean_text, syn_config=syn_cfg):
                         if hasattr(chunk, "audio_int16_bytes"):
                             audio_frames.extend(chunk.audio_int16_bytes)
                         elif isinstance(chunk, bytes):
                             audio_frames.extend(chunk)
+                    onnx_ms = (time.perf_counter() - t_onnx_start) * 1000.0
 
                     if len(audio_frames) > 0:
                         raw_samples = (
                             np.frombuffer(audio_frames, dtype=np.int16).astype(np.float32) / 32767.0
                         )
+                        t_dsp_start = time.perf_counter()
                         if abs(pitch_semitones) >= 0.05:
                             raw_samples = _apply_anime_pitch_shift(
                                 raw_samples, sample_rate, pitch_semitones
                             )
+                        dsp_ms = (time.perf_counter() - t_dsp_start) * 1000.0
                         wav_bytes = _write_wav_bytes(raw_samples, sample_rate=sample_rate)
                         engine_used = "piper"
                     else:
@@ -372,14 +374,18 @@ def _synthesize_wav_sync(
                 kokoro = get_kokoro_voice()
                 if kokoro is not None:
                     try:
+                        t_onnx_start = time.perf_counter()
                         samples, sample_rate = kokoro.create(
                             clean_text,
                             voice="jf_alpha",
                             speed=user_speed,
                             lang="es"
                         )
+                        onnx_ms = (time.perf_counter() - t_onnx_start) * 1000.0
+                        t_dsp_start = time.perf_counter()
                         if abs(pitch_semitones) >= 0.05:
                             samples = _apply_anime_pitch_shift(samples, sample_rate, pitch_semitones)
+                        dsp_ms = (time.perf_counter() - t_dsp_start) * 1000.0
                         wav_bytes = _write_wav_bytes(samples, sample_rate=sample_rate)
                         engine_used = "kokoro"
                     except Exception as e:
@@ -389,14 +395,18 @@ def _synthesize_wav_sync(
             kokoro = get_kokoro_voice()
             if kokoro is not None:
                 try:
+                    t_onnx_start = time.perf_counter()
                     samples, sample_rate = kokoro.create(
                         clean_text,
                         voice=target_voice,
                         speed=user_speed,
                         lang=detected_lang
                     )
+                    onnx_ms = (time.perf_counter() - t_onnx_start) * 1000.0
+                    t_dsp_start = time.perf_counter()
                     if abs(pitch_semitones) >= 0.05:
                         samples = _apply_anime_pitch_shift(samples, sample_rate, pitch_semitones)
+                    dsp_ms = (time.perf_counter() - t_dsp_start) * 1000.0
                     wav_bytes = _write_wav_bytes(samples, sample_rate=sample_rate)
                     engine_used = "kokoro"
                 except Exception as e:
@@ -417,20 +427,24 @@ def _synthesize_wav_sync(
                         sample_rate = getattr(getattr(voice, "config", None), "sample_rate", 22050)
                         audio_frames = bytearray()
 
+                        t_onnx_start = time.perf_counter()
                         for chunk in voice.synthesize(clean_text, syn_config=syn_cfg):
                             if hasattr(chunk, "audio_int16_bytes"):
                                 audio_frames.extend(chunk.audio_int16_bytes)
                             elif isinstance(chunk, bytes):
                                 audio_frames.extend(chunk)
+                        onnx_ms = (time.perf_counter() - t_onnx_start) * 1000.0
 
                         if len(audio_frames) > 0:
                             raw_samples = (
                                 np.frombuffer(audio_frames, dtype=np.int16).astype(np.float32) / 32767.0
                             )
+                            t_dsp_start = time.perf_counter()
                             if abs(pitch_semitones) >= 0.05:
                                 raw_samples = _apply_anime_pitch_shift(
                                     raw_samples, sample_rate, pitch_semitones
                                 )
+                            dsp_ms = (time.perf_counter() - t_dsp_start) * 1000.0
                             wav_bytes = _write_wav_bytes(raw_samples, sample_rate=sample_rate)
                             engine_used = "piper"
                         else:
@@ -457,6 +471,8 @@ def _synthesize_wav_sync(
             "chars": chars,
             "lock_wait_ms": lock_wait_ms,
             "infer_ms": infer_ms,
+            "onnx_ms": onnx_ms,
+            "dsp_ms": dsp_ms,
             "audio_dur_ms": audio_dur_ms,
             "bytes": len(wav_bytes)
         }
@@ -490,7 +506,8 @@ async def generate_speech(req: SpeechRequest):
     logger.info(
         f"🔊 [TTS Synthesis] voice='{metrics['voice']}' ({metrics['engine']}), lang='{metrics['lang']}', "
         f"chars={metrics['chars']} | lock_wait={metrics['lock_wait_ms']:.1f}ms, "
-        f"infer={metrics['infer_ms']:.1f}ms | audio_dur={metrics['audio_dur_ms']:.0f}ms ({metrics['bytes']}B)"
+        f"infer={metrics['infer_ms']:.1f}ms (onnx={metrics.get('onnx_ms', 0.0):.1f}ms, dsp={metrics.get('dsp_ms', 0.0):.1f}ms) | "
+        f"audio_dur={metrics['audio_dur_ms']:.0f}ms ({metrics['bytes']}B)"
     )
     return Response(
         content=wav_bytes,
@@ -530,6 +547,12 @@ async def tts_endpoint(req: SpeechRequest):
         lang,
         pitch,
         model=model_req
+    )
+    logger.info(
+        f"🔊 [TTS Synthesis] voice='{metrics['voice']}' ({metrics['engine']}), lang='{metrics['lang']}', "
+        f"chars={metrics['chars']} | lock_wait={metrics['lock_wait_ms']:.1f}ms, "
+        f"infer={metrics['infer_ms']:.1f}ms (onnx={metrics.get('onnx_ms', 0.0):.1f}ms, dsp={metrics.get('dsp_ms', 0.0):.1f}ms) | "
+        f"audio_dur={metrics['audio_dur_ms']:.0f}ms ({metrics['bytes']}B)"
     )
     import base64
     audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
