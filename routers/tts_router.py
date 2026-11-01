@@ -552,7 +552,7 @@ async def list_voices():
         "voices": [
             {
                 "id": "jf_alpha",
-                "name": "🌸 Alpha (Kokoro Anime Japonés / Español Dulce)",
+                "name": "Alpha (Kokoro Anime Japonés / Español Dulce)",
                 "engine": "kokoro",
                 "tier": "high_fidelity",
                 "description": "Estándar de alta fidelidad neuronal recomendada",
@@ -561,7 +561,7 @@ async def list_voices():
             },
             {
                 "id": "piper_f",
-                "name": "⚡ Sharvard (Piper Local - Bajo consumo / Ultra-rápido en CPU)",
+                "name": "Sharvard (Piper Local - Bajo consumo / Ultra-rápido en CPU)",
                 "engine": "piper",
                 "tier": "low_consumption_cpu",
                 "description": "Bajo consumo y ultra-rápido en CPU para nodos modestos sin GPU",
@@ -570,7 +570,7 @@ async def list_voices():
             },
             {
                 "id": "jf_nezumi",
-                "name": "🐭 Nezumi (Kokoro Anime Tierno)",
+                "name": "Nezumi (Kokoro Anime Tierno)",
                 "engine": "kokoro",
                 "tier": "high_fidelity",
                 "description": "Voz tierna de alta fidelidad",
@@ -579,7 +579,7 @@ async def list_voices():
             },
             {
                 "id": "jf_gongitsune",
-                "name": "🦊 Gongitsune (Kokoro Anime Elegante)",
+                "name": "Gongitsune (Kokoro Anime Elegante)",
                 "engine": "kokoro",
                 "tier": "high_fidelity",
                 "description": "Voz elegante de alta fidelidad",
@@ -588,7 +588,7 @@ async def list_voices():
             },
             {
                 "id": "jf_tebukuro",
-                "name": "🧤 Tebukuro (Kokoro Anime Suave)",
+                "name": "Tebukuro (Kokoro Anime Suave)",
                 "engine": "kokoro",
                 "tier": "high_fidelity",
                 "description": "Voz suave de alta fidelidad",
@@ -597,7 +597,7 @@ async def list_voices():
             },
             {
                 "id": "ef_dora",
-                "name": "🇪🇸 Dora (Kokoro Local - Español Femenino)",
+                "name": "Dora (Kokoro Local - Español Femenino)",
                 "engine": "kokoro",
                 "tier": "high_fidelity",
                 "description": "Español nativo de alta fidelidad",
@@ -606,7 +606,7 @@ async def list_voices():
             },
             {
                 "id": "af_bella",
-                "name": "🇺🇸 Bella (Kokoro Local - Inglés Femenino)",
+                "name": "Bella (Kokoro Local - Inglés Femenino)",
                 "engine": "kokoro",
                 "tier": "high_fidelity",
                 "description": "Inglés nativo de alta fidelidad",
@@ -615,7 +615,7 @@ async def list_voices():
             },
             {
                 "id": "af_sky",
-                "name": "🇺🇸 Sky (Kokoro Local - Inglés Femenino)",
+                "name": "Sky (Kokoro Local - Inglés Femenino)",
                 "engine": "kokoro",
                 "tier": "high_fidelity",
                 "description": "Inglés nativo de alta fidelidad",
