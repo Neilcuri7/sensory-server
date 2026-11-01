@@ -36,7 +36,8 @@ def get_recognizer():
     try:
         import sherpa_onnx
         if os.path.exists(WHISPER_BASE_ENCODER) and os.path.exists(WHISPER_BASE_DECODER) and os.path.exists(WHISPER_BASE_TOKENS):
-            num_threads = min(6, os.cpu_count() or 4)
+            # P-Core thread cap (Intel i7 14th gen: 4 threads for STT, 4 for TTS)
+            num_threads = min(4, os.cpu_count() or 4)
 
             # Detección elástica de acelerador GPU (CUDA)
             try:

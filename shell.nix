@@ -2,6 +2,9 @@
 
 pkgs.mkShell {
   name = "aoi-sensory-server-env";
+  # Note: For CUDA GPU acceleration on 6GB VRAM GPUs (RTX 4050/3060),
+  # ONNX Runtime automatically uses CUDAExecutionProvider when available with
+  # arena_extend_strategy=kSameAsRequested to avoid VRAM overcommit/OOM.
   buildInputs = with pkgs; [
     python312
     python312Packages.pip

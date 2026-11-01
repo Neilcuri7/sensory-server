@@ -63,8 +63,8 @@ class TestSensoryEndpoints(unittest.TestCase):
             self.assertIn("STT model not loaded", data.get("detail", ""))
 
     def test_stt_recognizer_threads_and_hardware_elasticity(self):
-        """Verifica que get_recognizer configure num_threads = min(6, os.cpu_count() or 4)."""
-        expected_threads = min(6, os.cpu_count() or 4)
+        """Verifica que get_recognizer configure num_threads = min(4, os.cpu_count() or 4) para P-cores."""
+        expected_threads = min(4, os.cpu_count() or 4)
         with patch("sherpa_onnx.OfflineRecognizer.from_whisper") as mock_whisper:
             mock_whisper.return_value = MagicMock()
             saved_rec = stt_router.recognizer
@@ -79,10 +79,11 @@ class TestSensoryEndpoints(unittest.TestCase):
                 stt_router.recognizer = saved_rec
 
     def test_tts_session_options_threads(self):
-        """Verifica que SessionOptions en CPU configure intra_op_num_threads = min(8, os.cpu_count() or 4)."""
-        expected_threads = min(8, os.cpu_count() or 4)
+        """Verifica que SessionOptions en CPU configure intra_op_num_threads = min(4, os.cpu_count() or 4) e inter_op=1."""
+        expected_threads = min(4, os.cpu_count() or 4)
         sess_options = tts_router._get_elastic_session_options()
         self.assertEqual(sess_options.intra_op_num_threads, expected_threads)
+        self.assertEqual(sess_options.inter_op_num_threads, 1)
         self.assertEqual(sess_options.log_severity_level, 3)
 
     def test_tts_hardware_detection_gpu_to_cpu_fallback(self):
@@ -164,9 +165,8 @@ class TestSensoryEndpoints(unittest.TestCase):
             f"El remuestreo tardó {elapsed_ms:.2f}ms, excediendo el límite de 10ms"
         )
 
-        # Verificaciones de sanidad y propiedades del audio
-        expected_len = max(1, int(len(samples) / (2.0 ** (2.0 / 12.0))))
-        self.assertEqual(len(shifted), expected_len)
+        # Verificaciones de sanidad y preservación estricta de tempo y duración
+        self.assertEqual(len(shifted), len(samples))
         self.assertEqual(shifted.dtype, samples.dtype)
 
         # Casos borde: tono despreciable o array vacío
@@ -176,6 +176,70 @@ class TestSensoryEndpoints(unittest.TestCase):
         empty = np.array([], dtype=np.float32)
         empty_shifted = tts_router._apply_anime_pitch_shift(empty, sample_rate, 2.0)
         self.assertEqual(len(empty_shifted), 0)
+
+    def test_spanish_inverted_punctuation_preserved_and_markdown_stripped(self):
+        """Verifica que ¿ y ¡ se preserven para espeak-ng, mientras se eliminan roleplay, emojis y markdown."""
+        raw_text = "*sonríe con emoción* ¡Hola Rylai! ¿Cómo estás hoy? 🌸✨ Mira esto: https://example.com ```código en bloque``` **genial** # Título ~tachado~"
+        cleaned = tts_router._sanitize_text_for_tts(raw_text)
+        # ¿ e ¡ deben preservarse intactos
+        self.assertIn("¿Cómo estás hoy?", cleaned)
+        self.assertIn("¡Hola Rylai!", cleaned)
+        # *sonríe con emoción* debe eliminarse por completo (no leerse)
+        self.assertNotIn("sonríe", cleaned)
+        # Emojis eliminados
+        self.assertNotIn("🌸", cleaned)
+        self.assertNotIn("✨", cleaned)
+        # URLs y bloques de código eliminados
+        self.assertNotIn("https://", cleaned)
+        self.assertNotIn("código en bloque", cleaned)
+        self.assertNotIn("*", cleaned)
+        self.assertNotIn("#", cleaned)
+
+    def test_detect_phoneme_lang_prefers_spanish(self):
+        """Verifica que voces jf_* no fuercen fonemas japoneses 'ja' en texto latino/español."""
+        # En español no debe devolver 'ja'
+        self.assertEqual(tts_router._detect_phoneme_lang("Hola Rylai, ¿cómo estás?", "jf_alpha"), "es")
+        self.assertEqual(tts_router._detect_phoneme_lang("Buenos días", "ef_dora"), "es")
+        # Solo en presencia de caracteres japoneses devuelve 'ja'
+        self.assertEqual(tts_router._detect_phoneme_lang("こんにちは", "jf_alpha"), "ja")
+        # Idioma explícito
+        self.assertEqual(tts_router._detect_phoneme_lang("Hello friend", "af_bella", requested_lang="en-us"), "en-us")
+
+    def test_soft_limiting_peak_normalization(self):
+        """Verifica que _write_wav_bytes aplique soft-limiting cuando el pico supera 0.98."""
+        loud_samples = np.array([0.0, 1.5, -1.8, 0.5], dtype=np.float32)
+        wav_bytes = tts_router._write_wav_bytes(loud_samples, sample_rate=24000)
+        read_samples, sr = tts_router._read_wav_samples(wav_bytes)
+        self.assertEqual(sr, 24000)
+        # El pico normalizado debe ser <= 1.0 (sin clipping digital de techo plano)
+        self.assertLessEqual(float(np.max(np.abs(read_samples))), 1.0)
+
+    def test_kokoro_voice_blending_resolution(self):
+        """Verifica que _resolve_kokoro_voice mezcle ef_dora + jf_alpha para español anime."""
+        mock_kokoro = MagicMock()
+        mock_kokoro.get_voices.return_value = ["ef_dora", "jf_alpha", "jf_nezumi"]
+        mock_kokoro.get_voice_style.side_effect = lambda name: np.ones((510, 1, 256), dtype=np.float32) * (1.0 if name == "ef_dora" else 2.0)
+
+        # Caso ef_rylai o jf_alpha en español: debe devolver el vector de estilo mezclado
+        blended = tts_router._resolve_kokoro_voice(mock_kokoro, "jf_alpha", "es")
+        self.assertIsInstance(blended, np.ndarray)
+        self.assertEqual(blended.shape, (510, 1, 256))
+        # 0.70 * 1.0 + 0.30 * 2.0 = 1.30
+        expected_val = 0.70 * 1.0 + 0.30 * 2.0
+        np.testing.assert_allclose(blended[0, 0, 0], expected_val, atol=1e-5)
+
+        # Fallback si kokoro no tiene get_voice_style (mock simple de test)
+        simple_mock = MagicMock(spec=["create"])
+        fallback_voice = tts_router._resolve_kokoro_voice(simple_mock, "jf_alpha", "es")
+        self.assertEqual(fallback_voice, "jf_alpha")
+
+    def test_voices_endpoint_includes_ef_rylai(self):
+        """Verifica que /v1/audio/voices incluya la voz ef_rylai."""
+        response = self.client.get("/v1/audio/voices")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        voice_ids = [v["id"] for v in data["voices"]]
+        self.assertIn("ef_rylai", voice_ids)
 
 
 if __name__ == "__main__":

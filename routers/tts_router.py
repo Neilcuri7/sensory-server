@@ -33,10 +33,12 @@ KOKORO_DIR = os.path.join(MODELS_DIR, "kokoro")
 
 piper_voice = None
 kokoro_voice = None
-_tts_lock = threading.Lock()
+_model_init_lock = threading.Lock()
+_espeak_piper_lock = threading.Lock()
 
 # Exclusivamente voces femeninas locales soportadas
 KOKORO_FEMALE_VOICES: Dict[str, str] = {
+    "ef_rylai": "es",
     "ef_dora": "es",
     "af_heart": "en-us",
     "af_bella": "en-us",
@@ -55,15 +57,45 @@ _SPANISH_WORD_REGEX = re.compile(
     r'\b(el|la|los|las|de|que|en|un|una|con|para|por|como|pero|más|hola|estoy|aquí|buenas|tardes|días|noches|claro|puedo|todo|bien|gracias|qué|cómo|está|estás|soy|tienes|quieres)\b',
     re.IGNORECASE
 )
-_JAPANESE_REGEX = re.compile(r'[\u3040-\u30ff\u4e00-\u9faf]')
-_SPANISH_CHAR_REGEX = re.compile(r'[áéíóúüñÁÉÍÓÚÜÑ]')
+_JAPANESE_REGEX = re.compile(r'[\u3040-\u30ff\u4e00-\u9fff]')
+_SPANISH_CHAR_REGEX = re.compile(r'[áéíóúüñÁÉÍÓÚÜÑ¿¡]')
+
+
+def _strip_emojis_and_symbols(text: str) -> str:
+    """Elimina emojis, dingbats y símbolos decorativos preservando caracteres y puntuación en español."""
+    import unicodedata
+    cleaned = []
+    for ch in text:
+        cat = unicodedata.category(ch)
+        cp = ord(ch)
+        # Excluir emojis y pictografías suplementarias, dingbats, símbolos decorativos y selectores de variación
+        if (
+            cat in ("So", "Sk")
+            or (0x1F300 <= cp <= 0x1FAFF)
+            or (0x2600 <= cp <= 0x27BF)
+            or cp in (0x200D, 0xFE0E, 0xFE0F)
+        ):
+            cleaned.append(" ")
+        else:
+            cleaned.append(ch)
+    return "".join(cleaned)
 
 
 def _sanitize_text_for_tts(text: str) -> str:
-    """Limpia puntuación que desincroniza el conteo de palabras en espeak-ng/phonemizer."""
+    """Limpia markdown, URLs, acciones roleplay y emojis preservando ¿ y ¡ para entonación nativa en español."""
     if not text:
         return ""
-    t = text.replace("¿", "").replace("¡", "")
+    # 1. Bloques de código formateados (fenced code blocks)
+    t = re.sub(r"```[\s\S]*?```", " ", text)
+    # 2. URLs
+    t = re.sub(r"https?://\S+", " ", t)
+    # 3. Acciones de roleplay entre asteriscos simples (*sonríe*)
+    t = re.sub(r"\*[^*\n]+\*", " ", t)
+    # 4. Símbolos markdown residuales (*, _, #, `, ~)
+    t = re.sub(r"[*_#`~]", " ", t)
+    # 5. Emojis y pictogramas
+    t = _strip_emojis_and_symbols(t)
+    # 6. Puntuación: NO eliminar ¿ ni ¡ (espeak-ng los usa para entonación exclamativa e interrogativa)
     t = t.replace("—", ", ").replace("–", ", ").replace("…", ". ").replace("...", ". ")
     t = re.sub(r'\s+', ' ', t).strip()
     return t
@@ -72,18 +104,63 @@ def _sanitize_text_for_tts(text: str) -> str:
 def _detect_phoneme_lang(text: str, voice_id: str, requested_lang: Optional[str] = None) -> str:
     """Detecta el idioma fonético adecuado para Kokoro ONNX evitando fallos de phonemizer."""
     if requested_lang and requested_lang.lower() not in ("auto", ""):
-        return requested_lang.lower()
+        req = requested_lang.lower()
+        if req == "ja":
+            return "ja"
+        if req in ("es", "en-us", "en-gb", "en"):
+            return "en-us" if req == "en" else req
+
+    # Solo retornar "ja" si el texto efectivamente contiene caracteres japoneses
     if _JAPANESE_REGEX.search(text):
         return "ja"
-    if voice_id == "ef_dora" or _SPANISH_CHAR_REGEX.search(text) or _SPANISH_WORD_REGEX.search(text):
-        return "es"
+
     if voice_id in ("af_heart", "af_bella", "af_sarah", "af_nicole", "af_sky"):
         return "en-us"
     if voice_id in ("bf_emma", "bf_isabella"):
         return "en-gb"
-    if voice_id.startswith("jf_"):
-        return "ja"
+
+    # En caso de texto en alfabeto latino/español o voces jf_* usadas en español, siempre "es"
     return "es"
+
+
+def _resolve_kokoro_voice(kokoro_instance, voice_id: str, lang: str):
+    """
+    Resuelve la voz para Kokoro ONNX:
+    - Si lang == 'es' y voice_id en ('ef_rylai', 'jf_alpha') o jf_*:
+      mezcla linealmente el estilo neuronal español de 'ef_dora' con el timbre anime de 'jf_alpha' (o voice_id).
+    - Mantiene compatibilidad con mocks de test unitarios.
+    """
+    if not hasattr(kokoro_instance, "get_voice_style") or not hasattr(kokoro_instance, "get_voices"):
+        return voice_id
+
+    try:
+        available = kokoro_instance.get_voices()
+    except Exception:
+        return voice_id
+
+    if not isinstance(available, (list, tuple, set)):
+        return voice_id
+
+    if lang == "es":
+        target_anime = "jf_alpha" if voice_id in ("ef_rylai", "jf_alpha") else voice_id
+        if "ef_dora" in available and target_anime in available:
+            try:
+                style_dora = kokoro_instance.get_voice_style("ef_dora")
+                style_anime = kokoro_instance.get_voice_style(target_anime)
+                weight_dora = 0.70 if voice_id in ("ef_rylai", "jf_alpha") else 0.65
+                weight_anime = 1.0 - weight_dora
+                blended = (weight_dora * style_dora + weight_anime * style_anime).astype(np.float32)
+                return blended
+            except Exception as e:
+                logger.warning(f"Error mezclando estilos Kokoro para {voice_id}: {e}")
+
+    if voice_id in available:
+        return voice_id
+    if "ef_dora" in available and lang == "es":
+        return "ef_dora"
+    if "jf_alpha" in available:
+        return "jf_alpha"
+    return voice_id
 
 
 def _apply_anime_pitch_shift(
@@ -91,21 +168,57 @@ def _apply_anime_pitch_shift(
     sample_rate: int,
     pitch_semitones: float,
 ) -> np.ndarray:
-    """Aplica cambio de tono (pitch shift) en semitonos mediante remuestreo ultra-rápido vectorizado en NumPy."""
+    """
+    Aplica cambio de tono (pitch shift) en semitonos conservando exactamente la duración y tempo (OLA con ventana Hann).
+    Garantiza len(output) == len(samples) y ejecución ultrarrápida (<10ms).
+    """
     if abs(pitch_semitones) < 0.05 or len(samples) == 0:
         return samples
+
     factor = 2.0 ** (pitch_semitones / 12.0)
-    new_length = max(1, int(len(samples) / factor))
-    orig_indices = np.linspace(0, len(samples) - 1, new_length, dtype=np.float32)
-    return np.interp(orig_indices, np.arange(len(samples), dtype=np.float32), samples).astype(samples.dtype)
+    orig_n = len(samples)
+    win_size = min(512, orig_n)
+    if win_size < 32:
+        return samples
+
+    hop = win_size // 4
+    rate = 1.0 / factor
+    s_hop = hop
+    a_hop = max(1, int(s_hop * rate))
+
+    window = np.hanning(win_size).astype(np.float32)
+    num_frames = (orig_n - win_size) // a_hop
+    if num_frames <= 0:
+        return samples
+
+    out_len = win_size + num_frames * s_hop
+    out = np.zeros(out_len, dtype=np.float32)
+    norm = np.zeros(out_len, dtype=np.float32)
+
+    for i in range(num_frames):
+        a_pos = i * a_hop
+        s_pos = i * s_hop
+        out[s_pos:s_pos + win_size] += samples[a_pos:a_pos + win_size] * window
+        norm[s_pos:s_pos + win_size] += window
+
+    mask = norm > 1e-4
+    out[mask] /= norm[mask]
+
+    target_stretched = max(1, int(orig_n * factor))
+    stretched = out[:target_stretched] if len(out) >= target_stretched else np.pad(out, (0, target_stretched - len(out)))
+
+    # Remuestrear stretched exactamente a orig_n para restaurar tempo y longitud original
+    orig_indices = np.linspace(0, len(stretched) - 1, orig_n, dtype=np.float32)
+    shifted = np.interp(orig_indices, np.arange(len(stretched), dtype=np.float32), stretched)
+    return shifted.astype(samples.dtype)
 
 
 def _get_elastic_session_options() -> ort.SessionOptions:
-    """Configura SessionOptions elásticas con intra_op_num_threads óptimo para CPU."""
+    """Configura SessionOptions elásticas con intra_op_num_threads óptimo para CPU i7 P-Cores."""
     sess_options = ort.SessionOptions()
-    cpu_threads = min(8, os.cpu_count() or 4)
+    cpu_threads = min(4, os.cpu_count() or 4)
     sess_options.intra_op_num_threads = cpu_threads
-    sess_options.inter_op_num_threads = 2
+    sess_options.inter_op_num_threads = 1
     # Silenciar advertencias internas de ONNX Runtime para degradación limpia a CPU
     sess_options.log_severity_level = 3
     return sess_options
@@ -116,32 +229,28 @@ def _create_elastic_inference_session(model_path: str) -> tuple[ort.InferenceSes
     Crea una sesión ONNX Runtime elástica:
     1. Detecta si CUDAExecutionProvider o DmlExecutionProvider (DirectML en Windows)
        están disponibles en onnxruntime.get_available_providers().
-    2. Si están disponibles, intenta usarlos junto con CPUExecutionProvider.
-    3. Si no están disponibles o falla la inicialización en GPU, degrada limpiamente y
-       sin advertencias a CPUExecutionProvider.
-    4. En CPU configura SessionOptions con intra_op_num_threads = min(8, os.cpu_count() or 4).
+    2. Si están disponibles, configura límites de VRAM (6GB) y arena_extend_strategy.
+    3. Si no están disponibles o falla la inicialización en GPU, degrada limpiamente a CPUExecutionProvider.
+    4. En CPU configura SessionOptions con intra_op_num_threads = min(4, os.cpu_count() or 4).
     """
     available = ort.get_available_providers()
     sess_options = _get_elastic_session_options()
     cpu_threads = sess_options.intra_op_num_threads
     model_name = os.path.basename(model_path)
 
-    # Identificar proveedores de aceleración por GPU soportados
-    gpu_providers: list[str] = []
-    if "CUDAExecutionProvider" in available:
-        gpu_providers.append("CUDAExecutionProvider")
-    elif "DmlExecutionProvider" in available:
-        gpu_providers.append("DmlExecutionProvider")
-
     session = None
     active_provider = "CPUExecutionProvider"
 
-    if gpu_providers:
-        candidate_providers = gpu_providers + ["CPUExecutionProvider"]
+    if "CUDAExecutionProvider" in available:
+        cuda_options = {
+            "arena_extend_strategy": "kSameAsRequested",
+            "gpu_mem_limit": 6 * 1024 * 1024 * 1024,
+        }
+        candidate_providers = [("CUDAExecutionProvider", cuda_options), "CPUExecutionProvider"]
         try:
             session = ort.InferenceSession(model_path, sess_options=sess_options, providers=candidate_providers)
             actual = session.get_providers()
-            if actual and actual[0] in gpu_providers:
+            if actual and actual[0] == "CUDAExecutionProvider":
                 active_provider = actual[0]
                 logger.info(f"⚡ ONNX Runtime '{model_name}' acelerado por GPU: {active_provider}")
             else:
@@ -149,6 +258,19 @@ def _create_elastic_inference_session(model_path: str) -> tuple[ort.InferenceSes
                 logger.info(f"ℹ️ ONNX Runtime '{model_name}' degradó a CPUExecutionProvider (threads={cpu_threads}).")
         except Exception as e:
             logger.info(f"ℹ️ GPU no disponible o fallo en inicialización para '{model_name}' ({e}). Degradando limpiamente a CPUExecutionProvider.")
+            session = None
+    elif "DmlExecutionProvider" in available:
+        candidate_providers = ["DmlExecutionProvider", "CPUExecutionProvider"]
+        try:
+            session = ort.InferenceSession(model_path, sess_options=sess_options, providers=candidate_providers)
+            actual = session.get_providers()
+            if actual and actual[0] == "DmlExecutionProvider":
+                active_provider = actual[0]
+                logger.info(f"⚡ ONNX Runtime '{model_name}' acelerado por DirectML: {active_provider}")
+            else:
+                active_provider = "CPUExecutionProvider"
+        except Exception as e:
+            logger.info(f"ℹ️ DirectML no disponible para '{model_name}' ({e}). Degradando a CPU.")
             session = None
 
     if session is None:
@@ -164,18 +286,21 @@ def get_piper_voice():
     if piper_voice is not None:
         return piper_voice
 
-    try:
-        from piper import PiperVoice
-        if os.path.exists(PIPER_ES_MODEL) and os.path.exists(PIPER_ES_CONFIG):
-            session, provider = _create_elastic_inference_session(PIPER_ES_MODEL)
-            piper_voice = PiperVoice.load(PIPER_ES_MODEL, config_path=PIPER_ES_CONFIG)
-            piper_voice.session = session
-            logger.info(f"Motor Piper TTS inicializado con éxito [provider={provider}].")
+    with _model_init_lock:
+        if piper_voice is not None:
             return piper_voice
-        else:
-            logger.warning(f"Archivos de modelo Piper no encontrados en {PIPER_DIR}.")
-    except Exception as e:
-        logger.warning(f"Piper TTS no disponible: {e}")
+        try:
+            from piper import PiperVoice
+            if os.path.exists(PIPER_ES_MODEL) and os.path.exists(PIPER_ES_CONFIG):
+                session, provider = _create_elastic_inference_session(PIPER_ES_MODEL)
+                piper_voice = PiperVoice.load(PIPER_ES_MODEL, config_path=PIPER_ES_CONFIG)
+                piper_voice.session = session
+                logger.info(f"Motor Piper TTS inicializado con éxito [provider={provider}].")
+                return piper_voice
+            else:
+                logger.warning(f"Archivos de modelo Piper no encontrados en {PIPER_DIR}.")
+        except Exception as e:
+            logger.warning(f"Piper TTS no disponible: {e}")
     return None
 
 
@@ -183,21 +308,25 @@ def get_kokoro_voice():
     global kokoro_voice
     if kokoro_voice is not None:
         return kokoro_voice
-    try:
-        from kokoro_onnx import Kokoro
-        model_path = os.path.join(KOKORO_DIR, "kokoro-v1.0.int8.onnx")
-        if not os.path.exists(model_path):
-            model_path = os.path.join(KOKORO_DIR, "kokoro-v1.0.onnx")
-        voices_path = os.path.join(KOKORO_DIR, "voices-v1.0.bin")
-        if os.path.exists(model_path) and os.path.exists(voices_path):
-            session, provider = _create_elastic_inference_session(model_path)
-            kokoro_voice = Kokoro.from_session(session, voices_path)
-            logger.info(f"Motor Kokoro ONNX inicializado con éxito [provider={provider}].")
+
+    with _model_init_lock:
+        if kokoro_voice is not None:
             return kokoro_voice
-        else:
-            logger.warning(f"Archivos de modelo Kokoro no encontrados en {KOKORO_DIR}.")
-    except Exception as e:
-        logger.warning(f"Kokoro ONNX no disponible: {e}")
+        try:
+            from kokoro_onnx import Kokoro
+            model_path = os.path.join(KOKORO_DIR, "kokoro-v1.0.int8.onnx")
+            if not os.path.exists(model_path):
+                model_path = os.path.join(KOKORO_DIR, "kokoro-v1.0.onnx")
+            voices_path = os.path.join(KOKORO_DIR, "voices-v1.0.bin")
+            if os.path.exists(model_path) and os.path.exists(voices_path):
+                session, provider = _create_elastic_inference_session(model_path)
+                kokoro_voice = Kokoro.from_session(session, voices_path)
+                logger.info(f"Motor Kokoro ONNX inicializado con éxito [provider={provider}].")
+                return kokoro_voice
+            else:
+                logger.warning(f"Archivos de modelo Kokoro no encontrados en {KOKORO_DIR}.")
+        except Exception as e:
+            logger.warning(f"Kokoro ONNX no disponible: {e}")
     return None
 
 
@@ -254,8 +383,12 @@ def _read_wav_samples(wav_bytes: bytes) -> tuple:
 
 
 def _write_wav_bytes(samples: np.ndarray, sample_rate: int = 24000) -> bytes:
-    """Convierte un array de samples numpy (float32 o int16) en un WAV PCM de 16 bits."""
+    """Convierte un array de samples numpy (float32 o int16) en un WAV PCM de 16 bits con soft-limiting de picos."""
     if samples.dtype in (np.float32, np.float64):
+        if len(samples) > 0:
+            peak = float(np.max(np.abs(samples)))
+            if peak > 0.98:
+                samples = samples * (0.98 / peak)
         clipped = np.clip(samples, -1.0, 1.0)
         int_data = (clipped * 32767.0).astype(np.int16)
     elif samples.dtype == np.int16:
@@ -291,46 +424,47 @@ def _synthesize_wav_sync(
     pitch_semitones: float = 2.0,
     model: Optional[str] = None,
 ) -> tuple[bytes, dict]:
-    """Función de síntesis síncrona thread-safe protegida por _tts_lock."""
-    t_wait_start = time.perf_counter()
-    with _tts_lock:
-        lock_wait_ms = (time.perf_counter() - t_wait_start) * 1000.0
-        clean_text = _sanitize_text_for_tts(text)
-        chars = len(clean_text)
-        if not clean_text:
-            dummy = _generate_wav_bytes(b"\x00" * 4410, sample_rate=22050)
-            metrics = {
-                "voice": voice_id,
-                "engine": "empty",
-                "lang": "none",
-                "chars": 0,
-                "lock_wait_ms": lock_wait_ms,
-                "infer_ms": 0.0,
-                "onnx_ms": 0.0,
-                "dsp_ms": 0.0,
-                "audio_dur_ms": 100.0,
-                "bytes": len(dummy)
-            }
-            return dummy, metrics
+    """Función de síntesis síncrona thread-safe con concurrencia fina para Kokoro y lock para Piper."""
+    lock_wait_ms = 0.0
+    clean_text = _sanitize_text_for_tts(text)
+    chars = len(clean_text)
+    if not clean_text:
+        dummy = _generate_wav_bytes(b"\x00" * 4410, sample_rate=22050)
+        metrics = {
+            "voice": voice_id,
+            "engine": "empty",
+            "lang": "none",
+            "chars": 0,
+            "lock_wait_ms": 0.0,
+            "infer_ms": 0.0,
+            "onnx_ms": 0.0,
+            "dsp_ms": 0.0,
+            "audio_dur_ms": 100.0,
+            "bytes": len(dummy)
+        }
+        return dummy, metrics
 
-        user_speed = max(0.5, min(2.0, float(speed)))
-        req_model = (model or "").lower().strip()
-        is_piper = (
-            req_model in ("piper", "piper-tts", "piper_f", "sharvard") or
-            voice_id in ("piper_f", "piper_sharvard_f", "es_ES-sharvard-medium", "1", "sharvard", "sharvard-medium")
-        )
+    user_speed = max(0.5, min(2.0, float(speed)))
+    req_model = (model or "").lower().strip()
+    is_piper = (
+        req_model in ("piper", "piper-tts", "piper_f", "sharvard") or
+        voice_id in ("piper_f", "piper_sharvard_f", "es_ES-sharvard-medium", "1", "sharvard", "sharvard-medium")
+    )
 
-        target_voice = "piper_f" if is_piper else (voice_id if voice_id in KOKORO_FEMALE_VOICES else "jf_alpha")
-        detected_lang = "es" if is_piper else _detect_phoneme_lang(clean_text, target_voice, requested_lang=language)
-        engine_used = "fallback"
+    target_voice = "piper_f" if is_piper else (voice_id if voice_id in KOKORO_FEMALE_VOICES else "jf_alpha")
+    detected_lang = "es" if is_piper else _detect_phoneme_lang(clean_text, target_voice, requested_lang=language)
+    engine_used = "fallback"
 
-        t_infer_start = time.perf_counter()
-        wav_bytes = None
-        onnx_ms = 0.0
-        dsp_ms = 0.0
+    t_infer_start = time.perf_counter()
+    wav_bytes = None
+    onnx_ms = 0.0
+    dsp_ms = 0.0
 
-        # Si se solicita explícitamente Piper (o voice='piper_f'): sintetizar prioritariamente con Piper
-        if is_piper:
+    # Si se solicita explícitamente Piper (o voice='piper_f'): sintetizar prioritariamente con Piper (protegido por lock de espeakbridge)
+    if is_piper:
+        t_lock_start = time.perf_counter()
+        with _espeak_piper_lock:
+            lock_wait_ms = (time.perf_counter() - t_lock_start) * 1000.0
             voice = get_piper_voice()
             if voice is not None:
                 try:
@@ -369,38 +503,18 @@ def _synthesize_wav_sync(
                 except Exception as e:
                     logger.error(f"Error sintetizando con Piper: {e}")
 
-            # Fallback a Kokoro si Piper no estuviese listo
-            if wav_bytes is None:
-                kokoro = get_kokoro_voice()
-                if kokoro is not None:
-                    try:
-                        t_onnx_start = time.perf_counter()
-                        samples, sample_rate = kokoro.create(
-                            clean_text,
-                            voice="jf_alpha",
-                            speed=user_speed,
-                            lang="es"
-                        )
-                        onnx_ms = (time.perf_counter() - t_onnx_start) * 1000.0
-                        t_dsp_start = time.perf_counter()
-                        if abs(pitch_semitones) >= 0.05:
-                            samples = _apply_anime_pitch_shift(samples, sample_rate, pitch_semitones)
-                        dsp_ms = (time.perf_counter() - t_dsp_start) * 1000.0
-                        wav_bytes = _write_wav_bytes(samples, sample_rate=sample_rate)
-                        engine_used = "kokoro"
-                    except Exception as e:
-                        logger.warning(f"Fallback Kokoro también falló: {e}")
-        else:
-            # 1. Kokoro ONNX (Estándar de Alta Fidelidad)
+        # Fallback a Kokoro si Piper no estuviese listo
+        if wav_bytes is None:
             kokoro = get_kokoro_voice()
             if kokoro is not None:
                 try:
                     t_onnx_start = time.perf_counter()
+                    resolved_voice = _resolve_kokoro_voice(kokoro, "jf_alpha", "es")
                     samples, sample_rate = kokoro.create(
                         clean_text,
-                        voice=target_voice,
+                        voice=resolved_voice,
                         speed=user_speed,
-                        lang=detected_lang
+                        lang="es"
                     )
                     onnx_ms = (time.perf_counter() - t_onnx_start) * 1000.0
                     t_dsp_start = time.perf_counter()
@@ -410,10 +524,33 @@ def _synthesize_wav_sync(
                     wav_bytes = _write_wav_bytes(samples, sample_rate=sample_rate)
                     engine_used = "kokoro"
                 except Exception as e:
-                    logger.warning(f"Kokoro ONNX falló durante síntesis, probando Piper como fallback: {e}")
+                    logger.warning(f"Fallback Kokoro también falló: {e}")
+    else:
+        # 1. Kokoro ONNX (Estándar de Alta Fidelidad - Ejecución concurrente no bloqueante)
+        kokoro = get_kokoro_voice()
+        if kokoro is not None:
+            try:
+                t_onnx_start = time.perf_counter()
+                resolved_voice = _resolve_kokoro_voice(kokoro, target_voice, detected_lang)
+                samples, sample_rate = kokoro.create(
+                    clean_text,
+                    voice=resolved_voice,
+                    speed=user_speed,
+                    lang=detected_lang
+                )
+                onnx_ms = (time.perf_counter() - t_onnx_start) * 1000.0
+                t_dsp_start = time.perf_counter()
+                if abs(pitch_semitones) >= 0.05:
+                    samples = _apply_anime_pitch_shift(samples, sample_rate, pitch_semitones)
+                dsp_ms = (time.perf_counter() - t_dsp_start) * 1000.0
+                wav_bytes = _write_wav_bytes(samples, sample_rate=sample_rate)
+                engine_used = "kokoro"
+            except Exception as e:
+                logger.warning(f"Kokoro ONNX falló durante síntesis, probando Piper como fallback: {e}")
 
-            # 2. Piper TTS (100% Local - Femenino speaker_id=1 con control real de speed)
-            if wav_bytes is None:
+        # 2. Piper TTS (Fallback si Kokoro no está listo o falló)
+        if wav_bytes is None:
+            with _espeak_piper_lock:
                 voice = get_piper_voice()
                 if voice is not None:
                     try:
@@ -573,6 +710,15 @@ async def tts_endpoint(req: SpeechRequest):
 async def list_voices():
     return {
         "voices": [
+            {
+                "id": "ef_rylai",
+                "name": "Rylai (Kokoro Blend Español Nativo + Anime Dulce)",
+                "engine": "kokoro",
+                "tier": "high_fidelity",
+                "description": "Mezcla neuronal nativa en español con entonación anime dulce (ef_dora + jf_alpha)",
+                "language": "es",
+                "gender": "female"
+            },
             {
                 "id": "jf_alpha",
                 "name": "Alpha (Kokoro Anime Japonés / Español Dulce)",
