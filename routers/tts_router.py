@@ -33,8 +33,22 @@ KOKORO_DIR = os.path.join(MODELS_DIR, "kokoro")
 
 piper_voice = None
 kokoro_voice = None
+_kokoro_model = None
 _model_init_lock = threading.Lock()
 _espeak_piper_lock = threading.Lock()
+
+SENSORY_TIER = os.environ.get("SENSORY_TIER", "full").lower()
+preferred_engine = "piper" if SENSORY_TIER == "light" else "kokoro"
+
+
+def get_sensory_tier() -> str:
+    """Retorna el tier sensorial activo ('light', 'full')."""
+    return os.environ.get("SENSORY_TIER", SENSORY_TIER).lower()
+
+
+def get_preferred_engine() -> str:
+    """Retorna el motor preferido según el tier ('piper' en light, 'kokoro' en full)."""
+    return "piper" if get_sensory_tier() == "light" else "kokoro"
 
 # Exclusivamente voces femeninas locales soportadas
 KOKORO_FEMALE_VOICES: Dict[str, str] = {
@@ -304,13 +318,17 @@ def get_piper_voice():
     return None
 
 
-def get_kokoro_voice():
-    global kokoro_voice
+def _load_kokoro():
+    """Carga o retorna la instancia de Kokoro ONNX con soporte para degradación elegante en light tier."""
+    global kokoro_voice, _kokoro_model
     if kokoro_voice is not None:
+        _kokoro_model = kokoro_voice
         return kokoro_voice
 
+    tier = get_sensory_tier()
     with _model_init_lock:
         if kokoro_voice is not None:
+            _kokoro_model = kokoro_voice
             return kokoro_voice
         try:
             from kokoro_onnx import Kokoro
@@ -321,13 +339,28 @@ def get_kokoro_voice():
             if os.path.exists(model_path) and os.path.exists(voices_path):
                 session, provider = _create_elastic_inference_session(model_path)
                 kokoro_voice = Kokoro.from_session(session, voices_path)
+                _kokoro_model = kokoro_voice
                 logger.info(f"Motor Kokoro ONNX inicializado con éxito [provider={provider}].")
                 return kokoro_voice
             else:
-                logger.warning(f"Archivos de modelo Kokoro no encontrados en {KOKORO_DIR}.")
+                if tier == "light":
+                    logger.info("ℹ️ SENSORY_TIER=light activo: modelo Kokoro omitido (Piper listo para TTS).")
+                else:
+                    logger.warning(f"Archivos de modelo Kokoro no encontrados en {KOKORO_DIR}.")
+                kokoro_voice = None
+                _kokoro_model = None
+                return None
         except Exception as e:
-            logger.warning(f"Kokoro ONNX no disponible: {e}")
+            if tier == "light":
+                logger.info(f"ℹ️ SENSORY_TIER=light activo: Kokoro no disponible ({e}). Usando Piper.")
+            else:
+                logger.warning(f"Kokoro ONNX no disponible: {e}")
+            kokoro_voice = None
+            _kokoro_model = None
     return None
+
+
+get_kokoro_voice = _load_kokoro
 
 
 class SpeechRequest(BaseModel):
@@ -344,6 +377,7 @@ class SpeechRequest(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str = "ok"
+    tier: str = "full"
     default_engine: str = "kokoro"
     active_engine: str = "kokoro"
     piper_ready: bool = False
@@ -425,6 +459,7 @@ def _synthesize_wav_sync(
     model: Optional[str] = None,
 ) -> tuple[bytes, dict]:
     """Función de síntesis síncrona thread-safe con concurrencia fina para Kokoro y lock para Piper."""
+    tier = get_sensory_tier()
     lock_wait_ms = 0.0
     clean_text = _sanitize_text_for_tts(text)
     chars = len(clean_text)
@@ -447,6 +482,9 @@ def _synthesize_wav_sync(
     user_speed = max(0.5, min(2.0, float(speed)))
     req_model = (model or "").lower().strip()
     is_piper = (
+        tier == "light" or
+        preferred_engine == "piper" or
+        get_preferred_engine() == "piper" or
         req_model in ("piper", "piper-tts", "piper_f", "sharvard") or
         voice_id in ("piper_f", "piper_sharvard_f", "es_ES-sharvard-medium", "1", "sharvard", "sharvard-medium")
     )
@@ -460,7 +498,7 @@ def _synthesize_wav_sync(
     onnx_ms = 0.0
     dsp_ms = 0.0
 
-    # Si se solicita explícitamente Piper (o voice='piper_f'): sintetizar prioritariamente con Piper (protegido por lock de espeakbridge)
+    # Si se solicita explícitamente Piper o tier == 'light': sintetizar prioritariamente con Piper (protegido por lock de espeakbridge)
     if is_piper:
         t_lock_start = time.perf_counter()
         with _espeak_piper_lock:
@@ -503,8 +541,8 @@ def _synthesize_wav_sync(
                 except Exception as e:
                     logger.error(f"Error sintetizando con Piper: {e}")
 
-        # Fallback a Kokoro si Piper no estuviese listo
-        if wav_bytes is None:
+        # Fallback a Kokoro si Piper no estuviese listo (solo en full tier)
+        if wav_bytes is None and tier != "light":
             kokoro = get_kokoro_voice()
             if kokoro is not None:
                 try:
@@ -589,31 +627,34 @@ def _synthesize_wav_sync(
                     except Exception as e:
                         logger.error(f"Error sintetizando con Piper: {e}")
 
-        # 3. Fallback dummy silence si ningún motor está listo
-        if wav_bytes is None:
-            wav_bytes = _generate_wav_bytes(b"\x00" * 4410, sample_rate=22050)
-            engine_used = "fallback"
+    # 3. Fallback dummy silence si ningún motor está listo
+    if wav_bytes is None:
+        wav_bytes = _generate_wav_bytes(b"\x00" * 4410, sample_rate=22050)
+        engine_used = "fallback"
 
-        infer_ms = (time.perf_counter() - t_infer_start) * 1000.0
+    infer_ms = (time.perf_counter() - t_infer_start) * 1000.0
 
-        audio_dur_ms = 0.0
-        if len(wav_bytes) > 44:
-            sr = 24000 if engine_used == "kokoro" else 22050
-            audio_dur_ms = ((len(wav_bytes) - 44) / (sr * 2)) * 1000.0
+    audio_dur_ms = 0.0
+    if len(wav_bytes) > 44:
+        sr = 24000 if engine_used == "kokoro" else 22050
+        audio_dur_ms = ((len(wav_bytes) - 44) / (sr * 2)) * 1000.0
 
-        metrics = {
-            "voice": target_voice,
-            "engine": engine_used,
-            "lang": detected_lang,
-            "chars": chars,
-            "lock_wait_ms": lock_wait_ms,
-            "infer_ms": infer_ms,
-            "onnx_ms": onnx_ms,
-            "dsp_ms": dsp_ms,
-            "audio_dur_ms": audio_dur_ms,
-            "bytes": len(wav_bytes)
-        }
-        return wav_bytes, metrics
+    metrics = {
+        "voice": target_voice,
+        "engine": engine_used,
+        "lang": detected_lang,
+        "chars": chars,
+        "lock_wait_ms": lock_wait_ms,
+        "infer_ms": infer_ms,
+        "onnx_ms": onnx_ms,
+        "dsp_ms": dsp_ms,
+        "audio_dur_ms": audio_dur_ms,
+        "bytes": len(wav_bytes)
+    }
+    return wav_bytes, metrics
+
+
+synthesize_tts = _synthesize_wav_sync
 
 
 @router.post("/v1/audio/speech")
@@ -622,10 +663,15 @@ async def generate_speech(req: SpeechRequest):
     if not text:
         raise HTTPException(status_code=400, detail="Texto de entrada vacío.")
 
+    tier = get_sensory_tier()
     model_req = (req.model or "").lower().strip()
     voice_id = (req.voice or "").strip()
 
-    if model_req in ("piper", "piper-tts", "piper_f", "sharvard"):
+    if tier == "light":
+        model_req = "piper"
+        if not voice_id or voice_id not in ("piper_f", "piper_sharvard_f", "es_ES-sharvard-medium"):
+            voice_id = "piper_f"
+    elif model_req in ("piper", "piper-tts", "piper_f", "sharvard"):
         if not voice_id or voice_id in ("jf_alpha", "default"):
             voice_id = "piper_f"
     elif not voice_id:
@@ -663,10 +709,15 @@ async def tts_endpoint(req: SpeechRequest):
     if not text:
         raise HTTPException(status_code=400, detail="Texto de entrada vacío.")
 
+    tier = get_sensory_tier()
     model_req = (req.model or "").lower().strip()
     voice_id = (req.voice or "").strip()
 
-    if model_req in ("piper", "piper-tts", "piper_f", "sharvard"):
+    if tier == "light":
+        model_req = "piper"
+        if not voice_id or voice_id not in ("piper_f", "piper_sharvard_f", "es_ES-sharvard-medium"):
+            voice_id = "piper_f"
+    elif model_req in ("piper", "piper-tts", "piper_f", "sharvard"):
         if not voice_id or voice_id in ("jf_alpha", "default"):
             voice_id = "piper_f"
     elif not voice_id:
@@ -708,6 +759,9 @@ async def tts_endpoint(req: SpeechRequest):
 
 @router.get("/v1/audio/voices")
 async def list_voices():
+    tier = get_sensory_tier()
+    default_engine = "piper" if tier == "light" else "kokoro"
+    default_voice = "piper_f" if tier == "light" else "jf_alpha"
     return {
         "voices": [
             {
@@ -792,8 +846,9 @@ async def list_voices():
                 "gender": "female"
             }
         ],
-        "default_voice": "jf_alpha",
-        "default_engine": "kokoro",
+        "default_voice": default_voice,
+        "default_engine": default_engine,
+        "tier": tier,
         "engines": {
             "kokoro": {
                 "name": "Kokoro ONNX",

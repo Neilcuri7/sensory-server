@@ -60,9 +60,11 @@ async def lifespan(app: FastAPI):
     def _warmup_models():
         from routers.stt_router import get_recognizer
         from routers.tts_router import get_kokoro_voice, get_piper_voice
+        tier = os.environ.get("SENSORY_TIER", "full").lower()
         try:
             get_recognizer()
-            get_kokoro_voice()
+            if tier != "light":
+                get_kokoro_voice()
             get_piper_voice()
             logger.info("⚡ Modelos STT y TTS pre-cargados exitosamente en RAM.")
         except Exception as e:
@@ -105,16 +107,27 @@ async def health_check():
     kokoro_loaded = getattr(tts_mod, "kokoro_voice", None) is not None
     piper_loaded = getattr(tts_mod, "piper_voice", None) is not None
 
-    if stt_loaded and kokoro_loaded and piper_loaded:
-        health_status = "healthy"
-    elif stt_loaded or kokoro_loaded or piper_loaded:
-        health_status = "degraded"
+    tier = os.environ.get("SENSORY_TIER", getattr(tts_mod, "SENSORY_TIER", "full")).lower()
+
+    if tier == "light":
+        if stt_loaded and piper_loaded:
+            health_status = "healthy"
+        elif stt_loaded or piper_loaded:
+            health_status = "degraded"
+        else:
+            health_status = "down"
     else:
-        health_status = "down"
+        if stt_loaded and kokoro_loaded and piper_loaded:
+            health_status = "healthy"
+        elif stt_loaded or kokoro_loaded or piper_loaded:
+            health_status = "degraded"
+        else:
+            health_status = "down"
 
     return {
         "status": health_status,
         "service": "aoi-sensory-hub",
+        "tier": tier,
         "port": 8888,
         "models": {
             "stt": stt_loaded,

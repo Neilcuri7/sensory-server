@@ -241,6 +241,95 @@ class TestSensoryEndpoints(unittest.TestCase):
         voice_ids = [v["id"] for v in data["voices"]]
         self.assertIn("ef_rylai", voice_ids)
 
+    def test_load_kokoro_graceful_none_in_light_tier_when_files_missing(self):
+        """Verifica que _load_kokoro en light tier retorne None limpiamente sin error si los pesos no existen."""
+        with patch.dict(os.environ, {"SENSORY_TIER": "light"}):
+            with patch("os.path.exists", return_value=False):
+                orig_kokoro = tts_router.kokoro_voice
+                orig_model = tts_router._kokoro_model
+                try:
+                    tts_router.kokoro_voice = None
+                    tts_router._kokoro_model = None
+                    result = tts_router._load_kokoro()
+                    self.assertIsNone(result)
+                    self.assertIsNone(tts_router.kokoro_voice)
+                    self.assertIsNone(tts_router._kokoro_model)
+                finally:
+                    tts_router.kokoro_voice = orig_kokoro
+                    tts_router._kokoro_model = orig_model
+
+    def test_voices_endpoint_in_light_tier_defaults_to_piper(self):
+        """Verifica que /v1/audio/voices en SENSORY_TIER=light devuelva default_engine='piper' y default_voice='piper_f'."""
+        with patch.dict(os.environ, {"SENSORY_TIER": "light"}):
+            response = self.client.get("/v1/audio/voices")
+            self.assertEqual(response.status_code, 200)
+            data = response.json()
+            self.assertEqual(data.get("default_engine"), "piper")
+            self.assertEqual(data.get("default_voice"), "piper_f")
+            self.assertEqual(data.get("tier"), "light")
+
+    def test_speech_endpoint_light_tier_routes_to_piper_automatically(self):
+        """Verifica que peticiones a /v1/audio/speech y /tts en light tier se enruten a Piper incluso si piden Kokoro."""
+        dummy_wav = tts_router._generate_wav_bytes(b"\x00" * 4410, sample_rate=22050)
+        fake_metrics = {
+            "voice": "piper_f",
+            "engine": "piper",
+            "lang": "es",
+            "chars": 4,
+            "lock_wait_ms": 1.0,
+            "infer_ms": 5.0,
+            "audio_dur_ms": 100.0,
+            "bytes": len(dummy_wav)
+        }
+        with patch.dict(os.environ, {"SENSORY_TIER": "light"}):
+            with patch.object(tts_router, "_synthesize_wav_sync", return_value=(dummy_wav, fake_metrics)) as mock_synth:
+                # 1. /v1/audio/speech con model="kokoro" y voice="jf_alpha"
+                resp = self.client.post("/v1/audio/speech", json={"model": "kokoro", "voice": "jf_alpha", "input": "Hola"})
+                self.assertEqual(resp.status_code, 200)
+                self.assertEqual(resp.headers.get("X-TTS-Engine"), "piper")
+                self.assertEqual(resp.headers.get("X-TTS-Voice"), "piper_f")
+                _, kwargs = mock_synth.call_args
+                self.assertEqual(kwargs.get("model"), "piper")
+
+                # 2. /tts con model="kokoro"
+                resp_tts = self.client.post("/tts", json={"model": "kokoro", "voice": "jf_alpha", "text": "Hola"})
+                self.assertEqual(resp_tts.status_code, 200)
+                data_tts = resp_tts.json()
+                self.assertEqual(data_tts.get("engine"), "piper")
+                self.assertEqual(data_tts.get("voice"), "piper_f")
+
+    def test_synthesize_wav_sync_light_tier_uses_piper(self):
+        """Verifica que _synthesize_wav_sync y el alias synthesize_tts usen Piper sin invocar Kokoro en light tier."""
+        mock_piper = MagicMock()
+        mock_chunk = MagicMock()
+        mock_chunk.audio_int16_bytes = b"\x00\x00" * 2205
+        mock_piper.synthesize.return_value = [mock_chunk]
+        mock_piper.config.sample_rate = 22050
+
+        with patch.dict(os.environ, {"SENSORY_TIER": "light"}):
+            with patch.object(tts_router, "get_piper_voice", return_value=mock_piper):
+                with patch.object(tts_router, "get_kokoro_voice") as mock_kokoro:
+                    wav_bytes, metrics = tts_router.synthesize_tts("Hola mundo", "jf_alpha", 1.0)
+                    self.assertGreater(len(wav_bytes), 44)
+                    self.assertEqual(metrics["engine"], "piper")
+                    self.assertEqual(metrics["voice"], "piper_f")
+                    self.assertFalse(mock_kokoro.called)
+
+    def test_health_endpoint_healthy_in_light_tier_with_only_stt_and_piper(self):
+        """Verifica que /health reporte 'healthy' en light tier cuando solo stt y piper están cargados (kokoro omitido)."""
+        with patch.dict(os.environ, {"SENSORY_TIER": "light"}):
+            with patch.object(stt_router, "recognizer", MagicMock()):
+                with patch.object(tts_router, "piper_voice", MagicMock()):
+                    with patch.object(tts_router, "kokoro_voice", None):
+                        response = self.client.get("/health")
+                        self.assertEqual(response.status_code, 200)
+                        data = response.json()
+                        self.assertEqual(data["status"], "healthy")
+                        self.assertEqual(data["tier"], "light")
+                        self.assertFalse(data["models"]["kokoro"])
+                        self.assertTrue(data["models"]["piper"])
+                        self.assertTrue(data["models"]["stt"])
+
 
 if __name__ == "__main__":
     unittest.main()
