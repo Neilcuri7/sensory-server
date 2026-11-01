@@ -36,7 +36,31 @@ def get_recognizer():
     try:
         import sherpa_onnx
         if os.path.exists(WHISPER_BASE_ENCODER) and os.path.exists(WHISPER_BASE_DECODER) and os.path.exists(WHISPER_BASE_TOKENS):
-            num_threads = min(4, os.cpu_count() or 4)
+            num_threads = min(6, os.cpu_count() or 4)
+
+            # Detección elástica de acelerador GPU (CUDA)
+            try:
+                import onnxruntime as ort
+                available = ort.get_available_providers()
+                if "CUDAExecutionProvider" in available:
+                    try:
+                        recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
+                            encoder=WHISPER_BASE_ENCODER,
+                            decoder=WHISPER_BASE_DECODER,
+                            tokens=WHISPER_BASE_TOKENS,
+                            num_threads=num_threads,
+                            language="es",
+                            task="transcribe",
+                            debug=False,
+                            provider="cuda"
+                        )
+                        logger.info(f"Reconocedor Whisper Base ONNX inicializado con éxito [provider=cuda, threads={num_threads}].")
+                        return recognizer
+                    except Exception as e_cuda:
+                        logger.info(f"GPU no disponible para STT ({e_cuda}), degradando limpiamente a CPU.")
+            except Exception as e_ort:
+                logger.debug(f"Aviso en detección de provider STT: {e_ort}")
+
             recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
                 encoder=WHISPER_BASE_ENCODER,
                 decoder=WHISPER_BASE_DECODER,
@@ -44,9 +68,10 @@ def get_recognizer():
                 num_threads=num_threads,
                 language="es",
                 task="transcribe",
-                debug=False
+                debug=False,
+                provider="cpu"
             )
-            logger.info("Reconocedor Whisper Base ONNX inicializado con éxito.")
+            logger.info(f"Reconocedor Whisper Base ONNX inicializado con éxito [provider=cpu, threads={num_threads}].")
             return recognizer
         else:
             logger.warning(f"Modelos Whisper Base no encontrados en {WHISPER_BASE_DIR}.")

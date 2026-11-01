@@ -13,6 +13,7 @@ import asyncio
 from typing import Optional, Dict
 
 import numpy as np
+import onnxruntime as ort
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
@@ -105,6 +106,65 @@ def _apply_anime_pitch_shift(
         return np.interp(orig_indices, np.arange(len(samples)), samples).astype(samples.dtype)
 
 
+def _get_elastic_session_options() -> ort.SessionOptions:
+    """Configura SessionOptions elásticas con intra_op_num_threads óptimo para CPU."""
+    sess_options = ort.SessionOptions()
+    cpu_threads = min(8, os.cpu_count() or 4)
+    sess_options.intra_op_num_threads = cpu_threads
+    sess_options.inter_op_num_threads = 2
+    # Silenciar advertencias internas de ONNX Runtime para degradación limpia a CPU
+    sess_options.log_severity_level = 3
+    return sess_options
+
+
+def _create_elastic_inference_session(model_path: str) -> tuple[ort.InferenceSession, str]:
+    """
+    Crea una sesión ONNX Runtime elástica:
+    1. Detecta si CUDAExecutionProvider o DmlExecutionProvider (DirectML en Windows)
+       están disponibles en onnxruntime.get_available_providers().
+    2. Si están disponibles, intenta usarlos junto con CPUExecutionProvider.
+    3. Si no están disponibles o falla la inicialización en GPU, degrada limpiamente y
+       sin advertencias a CPUExecutionProvider.
+    4. En CPU configura SessionOptions con intra_op_num_threads = min(8, os.cpu_count() or 4).
+    """
+    available = ort.get_available_providers()
+    sess_options = _get_elastic_session_options()
+    cpu_threads = sess_options.intra_op_num_threads
+    model_name = os.path.basename(model_path)
+
+    # Identificar proveedores de aceleración por GPU soportados
+    gpu_providers: list[str] = []
+    if "CUDAExecutionProvider" in available:
+        gpu_providers.append("CUDAExecutionProvider")
+    elif "DmlExecutionProvider" in available:
+        gpu_providers.append("DmlExecutionProvider")
+
+    session = None
+    active_provider = "CPUExecutionProvider"
+
+    if gpu_providers:
+        candidate_providers = gpu_providers + ["CPUExecutionProvider"]
+        try:
+            session = ort.InferenceSession(model_path, sess_options=sess_options, providers=candidate_providers)
+            actual = session.get_providers()
+            if actual and actual[0] in gpu_providers:
+                active_provider = actual[0]
+                logger.info(f"⚡ ONNX Runtime '{model_name}' acelerado por GPU: {active_provider}")
+            else:
+                active_provider = "CPUExecutionProvider"
+                logger.info(f"ℹ️ ONNX Runtime '{model_name}' degradó a CPUExecutionProvider (threads={cpu_threads}).")
+        except Exception as e:
+            logger.info(f"ℹ️ GPU no disponible o fallo en inicialización para '{model_name}' ({e}). Degradando limpiamente a CPUExecutionProvider.")
+            session = None
+
+    if session is None:
+        session = ort.InferenceSession(model_path, sess_options=sess_options, providers=["CPUExecutionProvider"])
+        logger.info(f"ℹ️ ONNX Runtime '{model_name}' inicializado con CPUExecutionProvider (threads={cpu_threads}).")
+        active_provider = "CPUExecutionProvider"
+
+    return session, active_provider
+
+
 def get_piper_voice():
     global piper_voice
     if piper_voice is not None:
@@ -113,9 +173,13 @@ def get_piper_voice():
     try:
         from piper import PiperVoice
         if os.path.exists(PIPER_ES_MODEL) and os.path.exists(PIPER_ES_CONFIG):
+            session, provider = _create_elastic_inference_session(PIPER_ES_MODEL)
             piper_voice = PiperVoice.load(PIPER_ES_MODEL, config_path=PIPER_ES_CONFIG)
-            logger.info("Motor Piper TTS inicializado con éxito.")
+            piper_voice.session = session
+            logger.info(f"Motor Piper TTS inicializado con éxito [provider={provider}].")
             return piper_voice
+        else:
+            logger.warning(f"Archivos de modelo Piper no encontrados en {PIPER_DIR}.")
     except Exception as e:
         logger.warning(f"Piper TTS no disponible: {e}")
     return None
@@ -132,9 +196,12 @@ def get_kokoro_voice():
             model_path = os.path.join(KOKORO_DIR, "kokoro-v1.0.onnx")
         voices_path = os.path.join(KOKORO_DIR, "voices-v1.0.bin")
         if os.path.exists(model_path) and os.path.exists(voices_path):
-            kokoro_voice = Kokoro(model_path, voices_path)
-            logger.info("Motor Kokoro ONNX inicializado con éxito.")
+            session, provider = _create_elastic_inference_session(model_path)
+            kokoro_voice = Kokoro.from_session(session, voices_path)
+            logger.info(f"Motor Kokoro ONNX inicializado con éxito [provider={provider}].")
             return kokoro_voice
+        else:
+            logger.warning(f"Archivos de modelo Kokoro no encontrados en {KOKORO_DIR}.")
     except Exception as e:
         logger.warning(f"Kokoro ONNX no disponible: {e}")
     return None
@@ -228,6 +295,7 @@ def _synthesize_wav_sync(
     speed: float,
     language: Optional[str] = "es",
     pitch_semitones: float = 2.0,
+    model: Optional[str] = None,
 ) -> tuple[bytes, dict]:
     """Función de síntesis síncrona thread-safe protegida por _tts_lock."""
     t_wait_start = time.perf_counter()
@@ -250,35 +318,21 @@ def _synthesize_wav_sync(
             return dummy, metrics
 
         user_speed = max(0.5, min(2.0, float(speed)))
-        is_piper = voice_id in ("piper_f", "piper_sharvard_f", "es_ES-sharvard-medium", "1", "sharvard")
+        req_model = (model or "").lower().strip()
+        is_piper = (
+            req_model in ("piper", "piper-tts", "piper_f", "sharvard") or
+            voice_id in ("piper_f", "piper_sharvard_f", "es_ES-sharvard-medium", "1", "sharvard", "sharvard-medium")
+        )
 
-        target_voice = voice_id if voice_id in KOKORO_FEMALE_VOICES else "jf_alpha"
-        detected_lang = _detect_phoneme_lang(clean_text, target_voice, requested_lang=language) if not is_piper else "es"
+        target_voice = "piper_f" if is_piper else (voice_id if voice_id in KOKORO_FEMALE_VOICES else "jf_alpha")
+        detected_lang = "es" if is_piper else _detect_phoneme_lang(clean_text, target_voice, requested_lang=language)
         engine_used = "fallback"
 
         t_infer_start = time.perf_counter()
         wav_bytes = None
 
-        # 1. Kokoro ONNX (si no es explícitamente Piper)
-        if not is_piper:
-            kokoro = get_kokoro_voice()
-            if kokoro is not None:
-                try:
-                    samples, sample_rate = kokoro.create(
-                        clean_text,
-                        voice=target_voice,
-                        speed=user_speed,
-                        lang=detected_lang
-                    )
-                    if abs(pitch_semitones) >= 0.05:
-                        samples = _apply_anime_pitch_shift(samples, sample_rate, pitch_semitones)
-                    wav_bytes = _write_wav_bytes(samples, sample_rate=sample_rate)
-                    engine_used = "kokoro"
-                except Exception as e:
-                    logger.warning(f"Kokoro ONNX falló durante síntesis, probando Piper como fallback: {e}")
-
-        # 2. Piper TTS (100% Local - Femenino speaker_id=1 con control real de speed)
-        if wav_bytes is None:
+        # Si se solicita explícitamente Piper (o voice='piper_f'): sintetizar prioritariamente con Piper
+        if is_piper:
             voice = get_piper_voice()
             if voice is not None:
                 try:
@@ -309,9 +363,80 @@ def _synthesize_wav_sync(
                         wav_bytes = _write_wav_bytes(raw_samples, sample_rate=sample_rate)
                         engine_used = "piper"
                     else:
-                        logger.warning("Piper sintetizó 0 bytes de audio, generando silencio.")
+                        logger.warning("Piper sintetizó 0 bytes de audio.")
                 except Exception as e:
                     logger.error(f"Error sintetizando con Piper: {e}")
+
+            # Fallback a Kokoro si Piper no estuviese listo
+            if wav_bytes is None:
+                kokoro = get_kokoro_voice()
+                if kokoro is not None:
+                    try:
+                        samples, sample_rate = kokoro.create(
+                            clean_text,
+                            voice="jf_alpha",
+                            speed=user_speed,
+                            lang="es"
+                        )
+                        if abs(pitch_semitones) >= 0.05:
+                            samples = _apply_anime_pitch_shift(samples, sample_rate, pitch_semitones)
+                        wav_bytes = _write_wav_bytes(samples, sample_rate=sample_rate)
+                        engine_used = "kokoro"
+                    except Exception as e:
+                        logger.warning(f"Fallback Kokoro también falló: {e}")
+        else:
+            # 1. Kokoro ONNX (Estándar de Alta Fidelidad)
+            kokoro = get_kokoro_voice()
+            if kokoro is not None:
+                try:
+                    samples, sample_rate = kokoro.create(
+                        clean_text,
+                        voice=target_voice,
+                        speed=user_speed,
+                        lang=detected_lang
+                    )
+                    if abs(pitch_semitones) >= 0.05:
+                        samples = _apply_anime_pitch_shift(samples, sample_rate, pitch_semitones)
+                    wav_bytes = _write_wav_bytes(samples, sample_rate=sample_rate)
+                    engine_used = "kokoro"
+                except Exception as e:
+                    logger.warning(f"Kokoro ONNX falló durante síntesis, probando Piper como fallback: {e}")
+
+            # 2. Piper TTS (100% Local - Femenino speaker_id=1 con control real de speed)
+            if wav_bytes is None:
+                voice = get_piper_voice()
+                if voice is not None:
+                    try:
+                        from piper.config import SynthesisConfig
+                        length_scale = 1.0 / user_speed
+                        try:
+                            syn_cfg = SynthesisConfig(speaker_id=1, length_scale=length_scale)
+                        except (TypeError, ValueError):
+                            syn_cfg = SynthesisConfig(speaker_id=1)
+
+                        sample_rate = getattr(getattr(voice, "config", None), "sample_rate", 22050)
+                        audio_frames = bytearray()
+
+                        for chunk in voice.synthesize(clean_text, syn_config=syn_cfg):
+                            if hasattr(chunk, "audio_int16_bytes"):
+                                audio_frames.extend(chunk.audio_int16_bytes)
+                            elif isinstance(chunk, bytes):
+                                audio_frames.extend(chunk)
+
+                        if len(audio_frames) > 0:
+                            raw_samples = (
+                                np.frombuffer(audio_frames, dtype=np.int16).astype(np.float32) / 32767.0
+                            )
+                            if abs(pitch_semitones) >= 0.05:
+                                raw_samples = _apply_anime_pitch_shift(
+                                    raw_samples, sample_rate, pitch_semitones
+                                )
+                            wav_bytes = _write_wav_bytes(raw_samples, sample_rate=sample_rate)
+                            engine_used = "piper"
+                        else:
+                            logger.warning("Piper sintetizó 0 bytes de audio, generando silencio.")
+                    except Exception as e:
+                        logger.error(f"Error sintetizando con Piper: {e}")
 
         # 3. Fallback dummy silence si ningún motor está listo
         if wav_bytes is None:
@@ -326,7 +451,7 @@ def _synthesize_wav_sync(
             audio_dur_ms = ((len(wav_bytes) - 44) / (sr * 2)) * 1000.0
 
         metrics = {
-            "voice": voice_id,
+            "voice": target_voice,
             "engine": engine_used,
             "lang": detected_lang,
             "chars": chars,
@@ -344,9 +469,14 @@ async def generate_speech(req: SpeechRequest):
     if not text:
         raise HTTPException(status_code=400, detail="Texto de entrada vacío.")
 
-    voice_id = (req.voice or "jf_alpha").strip()
-    if (req.model or "").lower() == "piper" and voice_id not in ("piper_f", "piper_sharvard_f"):
-        voice_id = "piper_f"
+    model_req = (req.model or "").lower().strip()
+    voice_id = (req.voice or "").strip()
+
+    if model_req in ("piper", "piper-tts", "piper_f", "sharvard"):
+        if not voice_id or voice_id in ("jf_alpha", "default"):
+            voice_id = "piper_f"
+    elif not voice_id:
+        voice_id = "jf_alpha"
 
     wav_bytes, metrics = await asyncio.to_thread(
         _synthesize_wav_sync,
@@ -354,14 +484,23 @@ async def generate_speech(req: SpeechRequest):
         voice_id,
         float(req.speed or 1.05),
         req.language or "es",
-        float(req.pitch_semitones if req.pitch_semitones is not None else 2.0)
+        float(req.pitch_semitones if req.pitch_semitones is not None else 2.0),
+        model=model_req
     )
     logger.info(
         f"🔊 [TTS Synthesis] voice='{metrics['voice']}' ({metrics['engine']}), lang='{metrics['lang']}', "
         f"chars={metrics['chars']} | lock_wait={metrics['lock_wait_ms']:.1f}ms, "
         f"infer={metrics['infer_ms']:.1f}ms | audio_dur={metrics['audio_dur_ms']:.0f}ms ({metrics['bytes']}B)"
     )
-    return Response(content=wav_bytes, media_type="audio/wav")
+    return Response(
+        content=wav_bytes,
+        media_type="audio/wav",
+        headers={
+            "X-TTS-Engine": metrics["engine"],
+            "X-TTS-Voice": metrics["voice"],
+            "X-TTS-Duration-Ms": str(int(metrics["audio_dur_ms"]))
+        }
+    )
 
 
 @router.post("/tts")
@@ -370,9 +509,14 @@ async def tts_endpoint(req: SpeechRequest):
     if not text:
         raise HTTPException(status_code=400, detail="Texto de entrada vacío.")
 
-    voice_id = (req.voice or "jf_alpha").strip()
-    if (req.model or "").lower() == "piper" and voice_id not in ("piper_f", "piper_sharvard_f"):
-        voice_id = "piper_f"
+    model_req = (req.model or "").lower().strip()
+    voice_id = (req.voice or "").strip()
+
+    if model_req in ("piper", "piper-tts", "piper_f", "sharvard"):
+        if not voice_id or voice_id in ("jf_alpha", "default"):
+            voice_id = "piper_f"
+    elif not voice_id:
+        voice_id = "jf_alpha"
 
     speed = float(req.speed or 1.05)
     pitch = float(req.pitch_semitones if req.pitch_semitones is not None else 2.0)
@@ -384,7 +528,8 @@ async def tts_endpoint(req: SpeechRequest):
         voice_id,
         speed,
         lang,
-        pitch
+        pitch,
+        model=model_req
     )
     import base64
     audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
@@ -405,13 +550,91 @@ async def tts_endpoint(req: SpeechRequest):
 async def list_voices():
     return {
         "voices": [
-            {"id": "jf_alpha", "name": "🌸 Alpha (Kokoro Anime Japonés / Español Dulce)", "language": "es", "gender": "female"},
-            {"id": "jf_nezumi", "name": "🐭 Nezumi (Kokoro Anime Tierno)", "language": "es", "gender": "female"},
-            {"id": "jf_gongitsune", "name": "🦊 Gongitsune (Kokoro Anime Elegante)", "language": "es", "gender": "female"},
-            {"id": "jf_tebukuro", "name": "🧤 Tebukuro (Kokoro Anime Suave)", "language": "es", "gender": "female"},
-            {"id": "ef_dora", "name": "🇪🇸 Dora (Kokoro Local - Español Femenino)", "language": "es", "gender": "female"},
-            {"id": "piper_f", "name": "⚡ Sharvard (Piper Local - Español Femenino)", "language": "es", "gender": "female"},
-            {"id": "af_bella", "name": "🇺🇸 Bella (Kokoro Local - Inglés Femenino)", "language": "en", "gender": "female"},
-            {"id": "af_sky", "name": "🇺🇸 Sky (Kokoro Local - Inglés Femenino)", "language": "en", "gender": "female"}
-        ]
+            {
+                "id": "jf_alpha",
+                "name": "🌸 Alpha (Kokoro Anime Japonés / Español Dulce)",
+                "engine": "kokoro",
+                "tier": "high_fidelity",
+                "description": "Estándar de alta fidelidad neuronal recomendada",
+                "language": "es",
+                "gender": "female"
+            },
+            {
+                "id": "piper_f",
+                "name": "⚡ Sharvard (Piper Local - Bajo consumo / Ultra-rápido en CPU)",
+                "engine": "piper",
+                "tier": "low_consumption_cpu",
+                "description": "Bajo consumo y ultra-rápido en CPU para nodos modestos sin GPU",
+                "language": "es",
+                "gender": "female"
+            },
+            {
+                "id": "jf_nezumi",
+                "name": "🐭 Nezumi (Kokoro Anime Tierno)",
+                "engine": "kokoro",
+                "tier": "high_fidelity",
+                "description": "Voz tierna de alta fidelidad",
+                "language": "es",
+                "gender": "female"
+            },
+            {
+                "id": "jf_gongitsune",
+                "name": "🦊 Gongitsune (Kokoro Anime Elegante)",
+                "engine": "kokoro",
+                "tier": "high_fidelity",
+                "description": "Voz elegante de alta fidelidad",
+                "language": "es",
+                "gender": "female"
+            },
+            {
+                "id": "jf_tebukuro",
+                "name": "🧤 Tebukuro (Kokoro Anime Suave)",
+                "engine": "kokoro",
+                "tier": "high_fidelity",
+                "description": "Voz suave de alta fidelidad",
+                "language": "es",
+                "gender": "female"
+            },
+            {
+                "id": "ef_dora",
+                "name": "🇪🇸 Dora (Kokoro Local - Español Femenino)",
+                "engine": "kokoro",
+                "tier": "high_fidelity",
+                "description": "Español nativo de alta fidelidad",
+                "language": "es",
+                "gender": "female"
+            },
+            {
+                "id": "af_bella",
+                "name": "🇺🇸 Bella (Kokoro Local - Inglés Femenino)",
+                "engine": "kokoro",
+                "tier": "high_fidelity",
+                "description": "Inglés nativo de alta fidelidad",
+                "language": "en",
+                "gender": "female"
+            },
+            {
+                "id": "af_sky",
+                "name": "🇺🇸 Sky (Kokoro Local - Inglés Femenino)",
+                "engine": "kokoro",
+                "tier": "high_fidelity",
+                "description": "Inglés nativo de alta fidelidad",
+                "language": "en",
+                "gender": "female"
+            }
+        ],
+        "default_voice": "jf_alpha",
+        "default_engine": "kokoro",
+        "engines": {
+            "kokoro": {
+                "name": "Kokoro ONNX",
+                "tier": "high_fidelity",
+                "description": "Estándar de alta fidelidad neuronal (GPU o CPU multi-hilo)"
+            },
+            "piper": {
+                "name": "Piper ONNX",
+                "tier": "low_consumption_cpu",
+                "description": "Bajo consumo y ultra-rápido en CPU para nodos sin GPU"
+            }
+        }
     }
