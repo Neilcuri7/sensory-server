@@ -68,8 +68,10 @@ def _sanitize_text_for_tts(text: str) -> str:
     return t
 
 
-def _detect_phoneme_lang(text: str, voice_id: str) -> str:
+def _detect_phoneme_lang(text: str, voice_id: str, requested_lang: Optional[str] = None) -> str:
     """Detecta el idioma fonético adecuado para Kokoro ONNX evitando fallos de phonemizer."""
+    if requested_lang and requested_lang.lower() not in ("auto", ""):
+        return requested_lang.lower()
     if _JAPANESE_REGEX.search(text):
         return "ja"
     if voice_id == "ef_dora" or _SPANISH_CHAR_REGEX.search(text) or _SPANISH_WORD_REGEX.search(text):
@@ -81,6 +83,26 @@ def _detect_phoneme_lang(text: str, voice_id: str) -> str:
     if voice_id.startswith("jf_"):
         return "ja"
     return "es"
+
+
+def _apply_anime_pitch_shift(
+    samples: np.ndarray,
+    sample_rate: int,
+    pitch_semitones: float,
+) -> np.ndarray:
+    """Aplica cambio de tono (pitch shift) en semitonos mediante remuestreo DSP de alta fidelidad."""
+    if abs(pitch_semitones) < 0.05 or len(samples) == 0:
+        return samples
+    factor = 2.0 ** (pitch_semitones / 12.0)
+    new_length = max(1, int(len(samples) / factor))
+    try:
+        import scipy.signal
+        shifted = scipy.signal.resample(samples, new_length)
+        return shifted.astype(samples.dtype)
+    except Exception as e:
+        logger.debug(f"Aviso DSP pitch shift fallback: {e}")
+        orig_indices = np.linspace(0, len(samples) - 1, new_length)
+        return np.interp(orig_indices, np.arange(len(samples)), samples).astype(samples.dtype)
 
 
 def get_piper_voice():
@@ -120,10 +142,14 @@ def get_kokoro_voice():
 
 class SpeechRequest(BaseModel):
     model: Optional[str] = Field(default="kokoro", description="Motor o modelo de voz ('kokoro', 'piper').")
-    input: str = Field(..., description="Texto a sintetizar.")
-    voice: Optional[str] = Field(default="ef_dora", description="Voz seleccionada (100% local femenina).")
+    input: Optional[str] = Field(default=None, description="Texto a sintetizar (OpenAI format).")
+    text: Optional[str] = Field(default=None, description="Texto a sintetizar (Rylai format).")
+    voice: Optional[str] = Field(default="jf_alpha", description="Voz seleccionada (100% local femenina).")
+    language: Optional[str] = Field(default="es", description="Idioma fonético ('es', 'ja', 'en-us').")
     response_format: Optional[str] = Field(default="wav", description="Formato de salida ('wav').")
-    speed: Optional[float] = Field(default=1.0, description="Velocidad de reproducción (0.25 a 4.0).")
+    speed: Optional[float] = Field(default=1.05, description="Velocidad de reproducción (0.25 a 4.0).")
+    pitch_semitones: Optional[float] = Field(default=2.0, description="Modificación de tono en semitonos (ej. +2.0 anime).")
+    sequence_id: Optional[int] = Field(default=0, description="ID secuencial de streaming de audio.")
 
 
 class HealthResponse(BaseModel):
@@ -196,7 +222,13 @@ def _generate_wav_bytes(audio_data: bytes, sample_rate: int = 22050) -> bytes:
     return out.getvalue()
 
 
-def _synthesize_wav_sync(text: str, voice_id: str, speed: float) -> tuple[bytes, dict]:
+def _synthesize_wav_sync(
+    text: str,
+    voice_id: str,
+    speed: float,
+    language: Optional[str] = "es",
+    pitch_semitones: float = 2.0,
+) -> tuple[bytes, dict]:
     """Función de síntesis síncrona thread-safe protegida por _tts_lock."""
     t_wait_start = time.perf_counter()
     with _tts_lock:
@@ -220,8 +252,8 @@ def _synthesize_wav_sync(text: str, voice_id: str, speed: float) -> tuple[bytes,
         user_speed = max(0.5, min(2.0, float(speed)))
         is_piper = voice_id in ("piper_f", "piper_sharvard_f", "es_ES-sharvard-medium", "1", "sharvard")
 
-        target_voice = voice_id if voice_id in KOKORO_FEMALE_VOICES else "ef_dora"
-        detected_lang = _detect_phoneme_lang(clean_text, target_voice) if not is_piper else "es"
+        target_voice = voice_id if voice_id in KOKORO_FEMALE_VOICES else "jf_alpha"
+        detected_lang = _detect_phoneme_lang(clean_text, target_voice, requested_lang=language) if not is_piper else "es"
         engine_used = "fallback"
 
         t_infer_start = time.perf_counter()
@@ -238,6 +270,8 @@ def _synthesize_wav_sync(text: str, voice_id: str, speed: float) -> tuple[bytes,
                         speed=user_speed,
                         lang=detected_lang
                     )
+                    if abs(pitch_semitones) >= 0.05:
+                        samples = _apply_anime_pitch_shift(samples, sample_rate, pitch_semitones)
                     wav_bytes = _write_wav_bytes(samples, sample_rate=sample_rate)
                     engine_used = "kokoro"
                 except Exception as e:
@@ -265,7 +299,14 @@ def _synthesize_wav_sync(text: str, voice_id: str, speed: float) -> tuple[bytes,
                             audio_frames.extend(chunk)
 
                     if len(audio_frames) > 0:
-                        wav_bytes = _generate_wav_bytes(bytes(audio_frames), sample_rate=sample_rate)
+                        raw_samples = (
+                            np.frombuffer(audio_frames, dtype=np.int16).astype(np.float32) / 32767.0
+                        )
+                        if abs(pitch_semitones) >= 0.05:
+                            raw_samples = _apply_anime_pitch_shift(
+                                raw_samples, sample_rate, pitch_semitones
+                            )
+                        wav_bytes = _write_wav_bytes(raw_samples, sample_rate=sample_rate)
                         engine_used = "piper"
                     else:
                         logger.warning("Piper sintetizó 0 bytes de audio, generando silencio.")
@@ -299,11 +340,11 @@ def _synthesize_wav_sync(text: str, voice_id: str, speed: float) -> tuple[bytes,
 
 @router.post("/v1/audio/speech")
 async def generate_speech(req: SpeechRequest):
-    text = req.input.strip()
+    text = (req.input or req.text or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="Texto de entrada vacío.")
 
-    voice_id = (req.voice or "ef_dora").strip()
+    voice_id = (req.voice or "jf_alpha").strip()
     if (req.model or "").lower() == "piper" and voice_id not in ("piper_f", "piper_sharvard_f"):
         voice_id = "piper_f"
 
@@ -311,7 +352,9 @@ async def generate_speech(req: SpeechRequest):
         _synthesize_wav_sync,
         text,
         voice_id,
-        float(req.speed or 1.0)
+        float(req.speed or 1.05),
+        req.language or "es",
+        float(req.pitch_semitones if req.pitch_semitones is not None else 2.0)
     )
     logger.info(
         f"🔊 [TTS Synthesis] voice='{metrics['voice']}' ({metrics['engine']}), lang='{metrics['lang']}', "
@@ -321,14 +364,54 @@ async def generate_speech(req: SpeechRequest):
     return Response(content=wav_bytes, media_type="audio/wav")
 
 
+@router.post("/tts")
+async def tts_endpoint(req: SpeechRequest):
+    text = (req.input or req.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Texto de entrada vacío.")
+
+    voice_id = (req.voice or "jf_alpha").strip()
+    if (req.model or "").lower() == "piper" and voice_id not in ("piper_f", "piper_sharvard_f"):
+        voice_id = "piper_f"
+
+    speed = float(req.speed or 1.05)
+    pitch = float(req.pitch_semitones if req.pitch_semitones is not None else 2.0)
+    lang = req.language or "es"
+
+    wav_bytes, metrics = await asyncio.to_thread(
+        _synthesize_wav_sync,
+        text,
+        voice_id,
+        speed,
+        lang,
+        pitch
+    )
+    import base64
+    audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
+    sample_rate = 24000 if metrics["engine"] == "kokoro" else 22050
+
+    return {
+        "status": "ok",
+        "audio_base64": audio_b64,
+        "sample_rate": sample_rate,
+        "duration_ms": metrics["audio_dur_ms"],
+        "voice": metrics["voice"],
+        "engine": metrics["engine"],
+        "sequence_id": req.sequence_id or 0
+    }
+
+
 @router.get("/v1/audio/voices")
 async def list_voices():
     return {
         "voices": [
-            {"id": "ef_dora", "name": "🌸 Dora (Kokoro Local - Español Femenino)", "language": "es", "gender": "female"},
+            {"id": "jf_alpha", "name": "🌸 Alpha (Kokoro Anime Japonés / Español Dulce)", "language": "es", "gender": "female"},
+            {"id": "jf_nezumi", "name": "🐭 Nezumi (Kokoro Anime Tierno)", "language": "es", "gender": "female"},
+            {"id": "jf_gongitsune", "name": "🦊 Gongitsune (Kokoro Anime Elegante)", "language": "es", "gender": "female"},
+            {"id": "jf_tebukuro", "name": "🧤 Tebukuro (Kokoro Anime Suave)", "language": "es", "gender": "female"},
+            {"id": "ef_dora", "name": "🇪🇸 Dora (Kokoro Local - Español Femenino)", "language": "es", "gender": "female"},
             {"id": "piper_f", "name": "⚡ Sharvard (Piper Local - Español Femenino)", "language": "es", "gender": "female"},
-            {"id": "af_heart", "name": "🇺🇸 Heart (Kokoro Local - Inglés Femenino)", "language": "en", "gender": "female"},
             {"id": "af_bella", "name": "🇺🇸 Bella (Kokoro Local - Inglés Femenino)", "language": "en", "gender": "female"},
-            {"id": "jf_alpha", "name": "🇯🇵 Alpha (Kokoro Local - Japonés Femenino)", "language": "ja", "gender": "female"}
+            {"id": "af_sky", "name": "🇺🇸 Sky (Kokoro Local - Inglés Femenino)", "language": "en", "gender": "female"}
         ]
     }

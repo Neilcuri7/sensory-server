@@ -136,3 +136,36 @@ async def transcribe_audio(
     except Exception as e:
         logger.error(f"Error en transcripción: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class STTJsonRequest(BaseModel):
+    audio_base64: str
+    sample_rate: Optional[int] = 16000
+    language: Optional[str] = "es"
+
+
+@router.post("/stt")
+async def transcribe_json(req: STTJsonRequest):
+    try:
+        import base64
+        raw_b64 = req.audio_base64
+        if "," in raw_b64:
+            raw_b64 = raw_b64.split(",", 1)[1]
+        audio_bytes = base64.b64decode(raw_b64)
+        if not audio_bytes:
+            raise HTTPException(status_code=400, detail="Audio base64 vacío.")
+
+        text, metrics = await asyncio.to_thread(_transcribe_bytes_sync, audio_bytes)
+        return {
+            "status": "ok",
+            "text": text,
+            "confidence": 1.0,
+            "is_speech": len(text) > 0,
+            "sample_rate": metrics.get("sample_rate", req.sample_rate),
+            "duration_sec": metrics.get("duration_sec", 0.0)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error en endpoint /stt: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))

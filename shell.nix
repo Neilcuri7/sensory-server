@@ -17,6 +17,7 @@ pkgs.mkShell {
     xorg.libXext
     xorg.libXrender
     zlib
+    espeak-ng
   ];
 
   shellHook = ''
@@ -32,7 +33,10 @@ pkgs.mkShell {
       pkgs.xorg.libX11
       pkgs.xorg.libXext
       pkgs.xorg.libXrender
+      pkgs.espeak-ng
     ]}:$LD_LIBRARY_PATH"
+
+    export ESPEAK_DATA_PATH="${pkgs.espeak-ng}/share/espeak-ng-data"
 
     if [ ! -d ".venv" ]; then
       python -m venv .venv

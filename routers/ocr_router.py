@@ -125,3 +125,46 @@ async def ocr_image(file: UploadFile = File(...), min_confidence: float = 0.5):
     except Exception as e:
         logger.error(f"Error procesando OCR archivo: {e}")
         raise HTTPException(status_code=400, detail=str(e))
+
+
+class OCRUnifiedRequest(BaseModel):
+    image_base64: Optional[str] = None
+    image_b64: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    min_confidence: Optional[float] = 0.5
+
+
+@router.post("/ocr")
+async def ocr_unified(req: OCRUnifiedRequest):
+    raw_b64 = req.image_base64 or req.image_b64 or ""
+    if not raw_b64:
+        raise HTTPException(status_code=400, detail="Campo image_base64 o image_b64 requerido.")
+    if "," in raw_b64:
+        raw_b64 = raw_b64.split(",", 1)[1]
+    try:
+        img_bytes = base64.b64decode(raw_b64)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Base64 decoding error: {exc}")
+
+    res = _process_image_bytes(img_bytes, min_confidence=req.min_confidence or 0.5)
+    formatted_elements = []
+    for el in res.elements:
+        formatted_elements.append({
+            "bbox": el.box_rect,
+            "box_rect": el.box_rect,
+            "label": el.text,
+            "text": el.text,
+            "confidence": el.confidence,
+            "box": el.box,
+            "center": el.center,
+            "center_permille": el.center_permille,
+        })
+    return {
+        "status": res.status,
+        "text": res.text,
+        "elements": formatted_elements,
+        "count": len(formatted_elements),
+        "image_size": res.image_size,
+        "latency_ms": res.latency_ms
+    }
