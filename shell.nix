@@ -1,7 +1,7 @@
 { pkgs ? import <nixpkgs> {} }:
 
 pkgs.mkShell {
-  name = "aoi-sensory-server-env";
+  name = "sensory-server-env";
   # Note: For CUDA GPU acceleration on 6GB VRAM GPUs (RTX 4050/3060),
   # ONNX Runtime automatically uses CUDAExecutionProvider when available with
   # arena_extend_strategy=kSameAsRequested to avoid VRAM overcommit/OOM.
@@ -15,10 +15,10 @@ pkgs.mkShell {
     libGL
     libGLU
     glib
-    xorg.libxcb
-    xorg.libX11
-    xorg.libXext
-    xorg.libXrender
+    libxcb
+    libx11
+    libxext
+    libxrender
     zlib
     espeak-ng
   ];
@@ -32,10 +32,10 @@ pkgs.mkShell {
       pkgs.libGL
       pkgs.libGLU
       pkgs.glib
-      pkgs.xorg.libxcb
-      pkgs.xorg.libX11
-      pkgs.xorg.libXext
-      pkgs.xorg.libXrender
+      pkgs.libxcb
+      pkgs.libx11
+      pkgs.libxext
+      pkgs.libxrender
       pkgs.espeak-ng
     ]}:$LD_LIBRARY_PATH"
 
@@ -46,6 +46,6 @@ pkgs.mkShell {
     fi
     source .venv/bin/activate
     pip install --quiet -r requirements.txt
-    echo "🌸 Aoi Sensory Hub listo en puerto 8888."
+    echo "Sensory Server listo en puerto 8888."
   '';
 }

@@ -1,5 +1,5 @@
 """
-Tests unitarios para los endpoints de Aoi Sensory Hub (FastAPI).
+Tests unitarios para los endpoints de Sensory Server (FastAPI).
 Verifica:
 - Middleware de logging y propagación del header X-Request-ID.
 - Endpoint /health reportando estado de modelos y degradación.
@@ -179,11 +179,11 @@ class TestSensoryEndpoints(unittest.TestCase):
 
     def test_spanish_inverted_punctuation_preserved_and_markdown_stripped(self):
         """Verifica que ¿ y ¡ se preserven para espeak-ng, mientras se eliminan roleplay, emojis y markdown."""
-        raw_text = "*sonríe con emoción* ¡Hola Rylai! ¿Cómo estás hoy? 🌸✨ Mira esto: https://example.com ```código en bloque``` **genial** # Título ~tachado~"
+        raw_text = "*sonríe con emoción* ¡Hola mundo! ¿Cómo estás hoy? 🌸✨ Mira esto: https://example.com ```código en bloque``` **genial** # Título ~tachado~"
         cleaned = tts_router._sanitize_text_for_tts(raw_text)
         # ¿ e ¡ deben preservarse intactos
         self.assertIn("¿Cómo estás hoy?", cleaned)
-        self.assertIn("¡Hola Rylai!", cleaned)
+        self.assertIn("¡Hola mundo!", cleaned)
         # *sonríe con emoción* debe eliminarse por completo (no leerse)
         self.assertNotIn("sonríe", cleaned)
         # Emojis eliminados
@@ -198,7 +198,7 @@ class TestSensoryEndpoints(unittest.TestCase):
     def test_detect_phoneme_lang_prefers_spanish(self):
         """Verifica que voces jf_* no fuercen fonemas japoneses 'ja' en texto latino/español."""
         # En español no debe devolver 'ja'
-        self.assertEqual(tts_router._detect_phoneme_lang("Hola Rylai, ¿cómo estás?", "jf_alpha"), "es")
+        self.assertEqual(tts_router._detect_phoneme_lang("Hola amigo, ¿cómo estás?", "jf_alpha"), "es")
         self.assertEqual(tts_router._detect_phoneme_lang("Buenos días", "ef_dora"), "es")
         # Solo en presencia de caracteres japoneses devuelve 'ja'
         self.assertEqual(tts_router._detect_phoneme_lang("こんにちは", "jf_alpha"), "ja")
@@ -220,7 +220,7 @@ class TestSensoryEndpoints(unittest.TestCase):
         mock_kokoro.get_voices.return_value = ["ef_dora", "jf_alpha", "jf_nezumi"]
         mock_kokoro.get_voice_style.side_effect = lambda name: np.ones((510, 1, 256), dtype=np.float32) * (1.0 if name == "ef_dora" else 2.0)
 
-        # Caso ef_rylai o jf_alpha en español: debe devolver el vector de estilo mezclado
+        # Caso ef_blend o jf_alpha en español: debe devolver el vector de estilo mezclado
         blended = tts_router._resolve_kokoro_voice(mock_kokoro, "jf_alpha", "es")
         self.assertIsInstance(blended, np.ndarray)
         self.assertEqual(blended.shape, (510, 1, 256))
@@ -233,13 +233,13 @@ class TestSensoryEndpoints(unittest.TestCase):
         fallback_voice = tts_router._resolve_kokoro_voice(simple_mock, "jf_alpha", "es")
         self.assertEqual(fallback_voice, "jf_alpha")
 
-    def test_voices_endpoint_includes_ef_rylai(self):
-        """Verifica que /v1/audio/voices incluya la voz ef_rylai."""
+    def test_voices_endpoint_includes_ef_blend(self):
+        """Verifica que /v1/audio/voices incluya la voz ef_blend."""
         response = self.client.get("/v1/audio/voices")
         self.assertEqual(response.status_code, 200)
         data = response.json()
         voice_ids = [v["id"] for v in data["voices"]]
-        self.assertIn("ef_rylai", voice_ids)
+        self.assertIn("ef_blend", voice_ids)
 
     def test_load_kokoro_graceful_none_in_light_tier_when_files_missing(self):
         """Verifica que _load_kokoro en light tier retorne None limpiamente sin error si los pesos no existen."""

@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from PIL import Image
 
-logger = logging.getLogger("Aoi.Sensory.Vision")
+logger = logging.getLogger("Sensory.Vision")
 router = APIRouter(tags=["Vision"])
 
 

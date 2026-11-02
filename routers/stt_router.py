@@ -15,7 +15,7 @@ import soundfile as sf
 from fastapi import APIRouter, File, UploadFile, Form, HTTPException
 from pydantic import BaseModel
 
-logger = logging.getLogger("Aoi.Sensory.STT")
+logger = logging.getLogger("Sensory.STT")
 router = APIRouter(tags=["STT"])
 
 MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
@@ -147,11 +147,11 @@ async def transcribe_audio(
         try:
             text, metrics = await asyncio.to_thread(_transcribe_bytes_sync, audio_bytes)
         except RuntimeError as r_err:
-            logger.error(f"⚠️ [STT Unavailable] {r_err}")
+            logger.error(f"[STT Unavailable] {r_err}")
             raise HTTPException(status_code=503, detail=str(r_err))
 
         logger.info(
-            f"🎙️ [STT Ingest] {metrics['bytes']}B, {metrics['sample_rate']}Hz, "
+            f"[STT Ingest] {metrics['bytes']}B, {metrics['sample_rate']}Hz, "
             f"{metrics['duration_sec']:.2f}s audio | lock_wait={metrics['lock_wait_ms']:.1f}ms, "
             f"infer={metrics['infer_ms']:.1f}ms (RTF={metrics['rtf']:.2f}) | "
             f"text_len={metrics['text_len']}: '{text[:60]}'"

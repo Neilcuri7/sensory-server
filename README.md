@@ -1,34 +1,34 @@
-# ⚡ Sensory Hub Server
+# Sensory Hub Server
 
 > **Servidor Sensorial Unificado y Autónomo de Percepción Local**  
 > Motor de alto rendimiento en FastAPI que consolida **STT (Reconocimiento de Voz)**, **TTS (Síntesis de Voz Neuronal)**, **Visión Multimodal** y **OCR (Detección de Texto y UI Grounding)** en un único proceso optimizado en el puerto **`8888`**.
 
 ---
 
-## 🏛️ Arquitectura y Capacidades
+## Arquitectura y Capacidades
 
 | Módulo | Motor / Backend | Endpoint REST | Descripción |
 | :--- | :--- | :--- | :--- |
-| **🎙️ STT** | Sherpa-ONNX / Whisper-Base | `POST /v1/audio/transcriptions`<br/>`POST /stt` | Transcripción de audio OpenAI-compatible en $<150\text{ ms}$. |
-| **🔊 TTS** | Kokoro ONNX / Piper ONNX | `POST /v1/audio/speech`<br/>`POST /tts`<br/>`GET /v1/audio/voices` | Síntesis neural local con voice blending, OLA pitch shift y soft-limiting. |
-| **👁️ Visión** | Qwen2-VL / RapidOCR UI Grounding | `POST /v1/vision/inspect`<br/>`POST /v1/vision/locate-ui` | Inspección visual de capturas y localización de elementos de interfaz. |
-| **🔍 OCR** | RapidOCR (ONNX Runtime) | `POST /v1/ocr/image`<br/>`POST /v1/ocr/base64` | Extracción de texto y bounding boxes `[xmin, ymin, xmax, ymax]` en $<30\text{ ms}$. |
-| **🩺 Health** | Diagnóstico en tiempo real | `GET /health` | Estado del servicio, salud de modelos cargados y tier activo. |
+| **STT** | Sherpa-ONNX / Whisper-Base | `POST /v1/audio/transcriptions`<br/>`POST /stt` | Transcripción de audio OpenAI-compatible en $<150\text{ ms}$. |
+| **TTS** | Kokoro ONNX / Piper ONNX | `POST /v1/audio/speech`<br/>`POST /tts`<br/>`GET /v1/audio/voices` | Síntesis neural local con voice blending, OLA pitch shift y soft-limiting. |
+| **Visión** | Qwen2-VL / RapidOCR UI Grounding | `POST /v1/vision/inspect`<br/>`POST /v1/vision/locate-ui` | Inspección visual de capturas y localización de elementos de interfaz. |
+| **OCR** | RapidOCR (ONNX Runtime) | `POST /v1/ocr/image`<br/>`POST /v1/ocr/base64` | Extracción de texto y bounding boxes `[xmin, ymin, xmax, ymax]` en $<30\text{ ms}$. |
+| **Health** | Diagnóstico en tiempo real | `GET /health` | Estado del servicio, salud de modelos cargados y tier activo. |
 
 ---
 
-## 🎛️ Tiers de Hardware y Aprovisionamiento
+## Tiers de Hardware y Aprovisionamiento
 
 Sensory Hub permite seleccionar el nivel de modelos y consumo de recursos según la capacidad del dispositivo:
 
 | Nivel | Modelos Incluidos | Tamaño | Hardware Recomendado | Comportamiento |
 | :--- | :--- | :--- | :--- | :--- |
 | **`light`** | Whisper Base STT + Piper TTS (Voz femenina española) | ~185 MB | CPU de bajo consumo, laptops sin GPU dedicada, entornos limitados en RAM. | Enrutamiento automático ultrarrápido a Piper (<80ms en CPU, 0 RAM overhead). Omite Kokoro sin advertencias. |
-| **`full`** | Whisper Base STT + Piper TTS + **Kokoro v1.0 ONNX** (Español Anime) | ~300 MB | CPUs potentes (Intel Core i7 14ª Gen+) o GPUs NVIDIA (6 GB+ VRAM). | Activa síntesis Kokoro con voice blending neural (`ef_dora` + `jf_alpha`), OLA pitch shift y concurrencia multi-hilo. |
+| **`full`** | Whisper Base STT + Piper TTS + **Kokoro v1.0 ONNX** (Español Anime) | ~300 MB | CPUs potentes (Intel Core i7 14th Gen+) o GPUs NVIDIA (6 GB+ VRAM). | Activa síntesis Kokoro con voice blending neural (`ef_dora` + `jf_alpha`), OLA pitch shift y concurrencia multi-hilo. |
 
 ---
 
-## 🚀 Inicio Rápido
+## Inicio Rápido
 
 ### 1. Descargar Pesos de Modelos por Tier
 
@@ -78,7 +78,7 @@ docker run -d -p 8888:8888 --name sensory-hub-server sensory-hub-server
 
 ---
 
-## 🎧 Características Avanzadas del Pipeline de Audio
+## Características Avanzadas del Pipeline de Audio
 
 1. **Voice Blending Neuronal (Kokoro ONNX):**
    - Interpolación en espacio latente: 70% `ef_dora` (español nativo con fonética y prosodia correcta) + 30% `jf_alpha` (timbre dulce).
@@ -96,7 +96,7 @@ docker run -d -p 8888:8888 --name sensory-hub-server sensory-hub-server
 
 ---
 
-## 🧪 Verificación de Salud
+## Verificación de Salud
 
 ```bash
 curl http://localhost:8888/health
@@ -125,6 +125,6 @@ Respuesta esperada en `full` tier:
 
 ---
 
-## 📄 Licencia
+## Licencia
 
 MIT License.

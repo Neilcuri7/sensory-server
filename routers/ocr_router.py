@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException, UploadFile, File
 from pydantic import BaseModel, Field
 from PIL import Image
 
-logger = logging.getLogger("Aoi.Sensory.OCR")
+logger = logging.getLogger("Sensory.OCR")
 router = APIRouter(tags=["OCR"])
 
 ocr_engine = None

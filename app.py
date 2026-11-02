@@ -1,5 +1,5 @@
 """
-🌸 Aoi Sensory Hub Server (Unified Perception & Audio Microservice).
+Sensory Server (Unified Perception & Audio Microservice).
 Consolida STT (Sherpa/Whisper), TTS (Kokoro/Piper 100% Local), Visión (Qwen2-VL) y OCR (RapidOCR)
 en un único proceso FastAPI de alta eficiencia y bajo consumo de memoria.
 Puerto por defecto: 8888
@@ -20,13 +20,13 @@ from routers.tts_router import router as tts_router
 from routers.vision_router import router as vision_router
 from routers.ocr_router import router as ocr_router
 
-log_level_name = os.getenv("AOI_SENSORY_LOG_LEVEL", "INFO").upper()
+log_level_name = os.getenv("SENSORY_LOG_LEVEL", os.getenv("AOI_SENSORY_LOG_LEVEL", "INFO")).upper()
 log_level = getattr(logging, log_level_name, logging.INFO)
 logging.basicConfig(
     level=log_level,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
-logger = logging.getLogger("Aoi.SensoryHub")
+logger = logging.getLogger("SensoryHub")
 
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
@@ -54,7 +54,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🌸 Aoi Sensory Hub iniciando en puerto 8888...")
+    logger.info("Sensory Server iniciando en puerto 8888...")
 
     # Pre-calentar modelos ONNX en memoria para eliminar latencia en el primer turno
     def _warmup_models():
@@ -66,19 +66,19 @@ async def lifespan(app: FastAPI):
             if tier != "light":
                 get_kokoro_voice()
             get_piper_voice()
-            logger.info("⚡ Modelos STT y TTS pre-cargados exitosamente en RAM.")
+            logger.info("Modelos STT y TTS pre-cargados exitosamente en RAM.")
         except Exception as e:
             logger.warning(f"Aviso durante pre-carga de modelos: {e}")
 
     asyncio.create_task(asyncio.to_thread(_warmup_models))
     yield
-    logger.info("🛑 Deteniendo Aoi Sensory Hub...")
+    logger.info("Deteniendo Sensory Server...")
 
 
 app = FastAPI(
-    title="🌸 Aoi Sensory Hub",
+    title="Sensory Server",
     version="3.0.0",
-    description="Servidor unificado de percepción sensorial: Voz, Oídos, Visión y OCR para Aoi Desktop Companion.",
+    description="Servidor unificado de percepción sensorial: Voz, Oídos, Visión y OCR.",
     lifespan=lifespan
 )
 
@@ -126,7 +126,7 @@ async def health_check():
 
     return {
         "status": health_status,
-        "service": "aoi-sensory-hub",
+        "service": "sensory-hub",
         "tier": tier,
         "port": 8888,
         "models": {
@@ -145,7 +145,7 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("AOI_SENSORY_PORT", "8888"))
-    host = os.getenv("AOI_SENSORY_HOST", "0.0.0.0")
-    logger.info(f"Iniciando Aoi Sensory Hub en {host}:{port}")
+    port = int(os.getenv("SENSORY_PORT", os.getenv("AOI_SENSORY_PORT", "8888")))
+    host = os.getenv("SENSORY_HOST", os.getenv("AOI_SENSORY_HOST", "0.0.0.0"))
+    logger.info(f"Iniciando Sensory Server en {host}:{port}")
     uvicorn.run("app:app", host=host, port=port, reload=False)

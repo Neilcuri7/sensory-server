@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 # Silenciar desalineación de palabras en phonemizer (causada por signos ¿¡ en espeak-ng)
 logging.getLogger("phonemizer").setLevel(logging.ERROR)
 
-logger = logging.getLogger("Aoi.Sensory.TTS")
+logger = logging.getLogger("Sensory.TTS")
 router = APIRouter(tags=["TTS"])
 
 MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
@@ -52,7 +52,7 @@ def get_preferred_engine() -> str:
 
 # Exclusivamente voces femeninas locales soportadas
 KOKORO_FEMALE_VOICES: Dict[str, str] = {
-    "ef_rylai": "es",
+    "ef_blend": "es",
     "ef_dora": "es",
     "af_heart": "en-us",
     "af_bella": "en-us",
@@ -140,7 +140,7 @@ def _detect_phoneme_lang(text: str, voice_id: str, requested_lang: Optional[str]
 def _resolve_kokoro_voice(kokoro_instance, voice_id: str, lang: str):
     """
     Resuelve la voz para Kokoro ONNX:
-    - Si lang == 'es' y voice_id en ('ef_rylai', 'jf_alpha') o jf_*:
+    - Si lang == 'es' y voice_id en ('ef_blend', 'jf_alpha') o jf_*:
       mezcla linealmente el estilo neuronal español de 'ef_dora' con el timbre anime de 'jf_alpha' (o voice_id).
     - Mantiene compatibilidad con mocks de test unitarios.
     """
@@ -156,12 +156,12 @@ def _resolve_kokoro_voice(kokoro_instance, voice_id: str, lang: str):
         return voice_id
 
     if lang == "es":
-        target_anime = "jf_alpha" if voice_id in ("ef_rylai", "jf_alpha") else voice_id
+        target_anime = "jf_alpha" if voice_id in ("ef_blend", "jf_alpha") else voice_id
         if "ef_dora" in available and target_anime in available:
             try:
                 style_dora = kokoro_instance.get_voice_style("ef_dora")
                 style_anime = kokoro_instance.get_voice_style(target_anime)
-                weight_dora = 0.70 if voice_id in ("ef_rylai", "jf_alpha") else 0.65
+                weight_dora = 0.70 if voice_id in ("ef_blend", "jf_alpha") else 0.65
                 weight_anime = 1.0 - weight_dora
                 blended = (weight_dora * style_dora + weight_anime * style_anime).astype(np.float32)
                 return blended
@@ -266,12 +266,12 @@ def _create_elastic_inference_session(model_path: str) -> tuple[ort.InferenceSes
             actual = session.get_providers()
             if actual and actual[0] == "CUDAExecutionProvider":
                 active_provider = actual[0]
-                logger.info(f"⚡ ONNX Runtime '{model_name}' acelerado por GPU: {active_provider}")
+                logger.info(f"ONNX Runtime '{model_name}' acelerado por GPU: {active_provider}")
             else:
                 active_provider = "CPUExecutionProvider"
-                logger.info(f"ℹ️ ONNX Runtime '{model_name}' degradó a CPUExecutionProvider (threads={cpu_threads}).")
+                logger.info(f"ONNX Runtime '{model_name}' degrado a CPUExecutionProvider (threads={cpu_threads}).")
         except Exception as e:
-            logger.info(f"ℹ️ GPU no disponible o fallo en inicialización para '{model_name}' ({e}). Degradando limpiamente a CPUExecutionProvider.")
+            logger.info(f"GPU no disponible o fallo en inicializacion para '{model_name}' ({e}). Degradando limpiamente a CPUExecutionProvider.")
             session = None
     elif "DmlExecutionProvider" in available:
         candidate_providers = ["DmlExecutionProvider", "CPUExecutionProvider"]
@@ -280,16 +280,16 @@ def _create_elastic_inference_session(model_path: str) -> tuple[ort.InferenceSes
             actual = session.get_providers()
             if actual and actual[0] == "DmlExecutionProvider":
                 active_provider = actual[0]
-                logger.info(f"⚡ ONNX Runtime '{model_name}' acelerado por DirectML: {active_provider}")
+                logger.info(f"ONNX Runtime '{model_name}' acelerado por DirectML: {active_provider}")
             else:
                 active_provider = "CPUExecutionProvider"
         except Exception as e:
-            logger.info(f"ℹ️ DirectML no disponible para '{model_name}' ({e}). Degradando a CPU.")
+            logger.info(f"DirectML no disponible para '{model_name}' ({e}). Degradando a CPU.")
             session = None
 
     if session is None:
         session = ort.InferenceSession(model_path, sess_options=sess_options, providers=["CPUExecutionProvider"])
-        logger.info(f"ℹ️ ONNX Runtime '{model_name}' inicializado con CPUExecutionProvider (threads={cpu_threads}).")
+        logger.info(f"ONNX Runtime '{model_name}' inicializado con CPUExecutionProvider (threads={cpu_threads}).")
         active_provider = "CPUExecutionProvider"
 
     return session, active_provider
@@ -344,7 +344,7 @@ def _load_kokoro():
                 return kokoro_voice
             else:
                 if tier == "light":
-                    logger.info("ℹ️ SENSORY_TIER=light activo: modelo Kokoro omitido (Piper listo para TTS).")
+                    logger.info("SENSORY_TIER=light activo: modelo Kokoro omitido (Piper listo para TTS).")
                 else:
                     logger.warning(f"Archivos de modelo Kokoro no encontrados en {KOKORO_DIR}.")
                 kokoro_voice = None
@@ -352,7 +352,7 @@ def _load_kokoro():
                 return None
         except Exception as e:
             if tier == "light":
-                logger.info(f"ℹ️ SENSORY_TIER=light activo: Kokoro no disponible ({e}). Usando Piper.")
+                logger.info(f"SENSORY_TIER=light activo: Kokoro no disponible ({e}). Usando Piper.")
             else:
                 logger.warning(f"Kokoro ONNX no disponible: {e}")
             kokoro_voice = None
@@ -366,7 +366,7 @@ get_kokoro_voice = _load_kokoro
 class SpeechRequest(BaseModel):
     model: Optional[str] = Field(default="kokoro", description="Motor o modelo de voz ('kokoro', 'piper').")
     input: Optional[str] = Field(default=None, description="Texto a sintetizar (OpenAI format).")
-    text: Optional[str] = Field(default=None, description="Texto a sintetizar (Rylai format).")
+    text: Optional[str] = Field(default=None, description="Texto a sintetizar.")
     voice: Optional[str] = Field(default="jf_alpha", description="Voz seleccionada (100% local femenina).")
     language: Optional[str] = Field(default="es", description="Idioma fonético ('es', 'ja', 'en-us').")
     response_format: Optional[str] = Field(default="wav", description="Formato de salida ('wav').")
@@ -687,7 +687,7 @@ async def generate_speech(req: SpeechRequest):
         model=model_req
     )
     logger.info(
-        f"🔊 [TTS Synthesis] voice='{metrics['voice']}' ({metrics['engine']}), lang='{metrics['lang']}', "
+        f"[TTS Synthesis] voice='{metrics['voice']}' ({metrics['engine']}), lang='{metrics['lang']}', "
         f"chars={metrics['chars']} | lock_wait={metrics['lock_wait_ms']:.1f}ms, "
         f"infer={metrics['infer_ms']:.1f}ms (onnx={metrics.get('onnx_ms', 0.0):.1f}ms, dsp={metrics.get('dsp_ms', 0.0):.1f}ms) | "
         f"audio_dur={metrics['audio_dur_ms']:.0f}ms ({metrics['bytes']}B)"
@@ -737,7 +737,7 @@ async def tts_endpoint(req: SpeechRequest):
         model=model_req
     )
     logger.info(
-        f"🔊 [TTS Synthesis] voice='{metrics['voice']}' ({metrics['engine']}), lang='{metrics['lang']}', "
+        f"[TTS Synthesis] voice='{metrics['voice']}' ({metrics['engine']}), lang='{metrics['lang']}', "
         f"chars={metrics['chars']} | lock_wait={metrics['lock_wait_ms']:.1f}ms, "
         f"infer={metrics['infer_ms']:.1f}ms (onnx={metrics.get('onnx_ms', 0.0):.1f}ms, dsp={metrics.get('dsp_ms', 0.0):.1f}ms) | "
         f"audio_dur={metrics['audio_dur_ms']:.0f}ms ({metrics['bytes']}B)"
@@ -765,8 +765,8 @@ async def list_voices():
     return {
         "voices": [
             {
-                "id": "ef_rylai",
-                "name": "Rylai (Kokoro Blend Español Nativo + Anime Dulce)",
+                "id": "ef_blend",
+                "name": "Blend (Kokoro Blend Español Nativo + Anime Dulce)",
                 "engine": "kokoro",
                 "tier": "high_fidelity",
                 "description": "Mezcla neuronal nativa en español con entonación anime dulce (ef_dora + jf_alpha)",
