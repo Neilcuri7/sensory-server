@@ -137,27 +137,30 @@ def get_recognizer():
                 num_threads = default_threads
 
             # Detección elástica de acelerador GPU (CUDA)
-            try:
-                import onnxruntime as ort
-                available = ort.get_available_providers()
-                if "CUDAExecutionProvider" in available:
-                    try:
-                        recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
-                            encoder=encoder_path,
-                            decoder=decoder_path,
-                            tokens=tokens_path,
-                            num_threads=num_threads,
-                            language="es",
-                            task="transcribe",
-                            debug=False,
-                            provider="cuda"
-                        )
-                        logger.info(f"Reconocedor {model_label} ONNX inicializado con éxito [provider=cuda, threads={num_threads}].")
-                        return recognizer
-                    except Exception as e_cuda:
-                        logger.info(f"GPU no disponible para STT ({e_cuda}), degradando limpiamente a CPU.")
-            except Exception as e_ort:
-                logger.debug(f"Aviso en detección de provider STT: {e_ort}")
+            # Solo intenta provider='cuda' si sherpa_onnx lo soporta y ONNX Runtime puede cargar CUDA sin faltar librerías
+            force_cpu = os.environ.get("SENSORY_STT_FORCE_CPU", "0") == "1"
+            if not force_cpu:
+                try:
+                    import onnxruntime as ort
+                    available = ort.get_available_providers()
+                    if "CUDAExecutionProvider" in available:
+                        try:
+                            recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
+                                encoder=encoder_path,
+                                decoder=decoder_path,
+                                tokens=tokens_path,
+                                num_threads=num_threads,
+                                language="es",
+                                task="transcribe",
+                                debug=False,
+                                provider="cuda"
+                            )
+                            logger.info(f"Reconocedor {model_label} ONNX inicializado con éxito [provider=cuda, threads={num_threads}].")
+                            return recognizer
+                        except Exception as e_cuda:
+                            logger.info(f"GPU no disponible para STT ({e_cuda}), degradando limpiamente a CPU.")
+                except Exception as e_ort:
+                    logger.debug(f"Aviso en detección de provider STT: {e_ort}")
 
             recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
                 encoder=encoder_path,
