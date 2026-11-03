@@ -11,6 +11,7 @@ import os
 import io
 import time
 import wave
+import threading
 import unittest
 from unittest.mock import patch, MagicMock
 from fastapi.testclient import TestClient
@@ -329,6 +330,126 @@ class TestSensoryEndpoints(unittest.TestCase):
                         self.assertFalse(data["models"]["kokoro"])
                         self.assertTrue(data["models"]["piper"])
                         self.assertTrue(data["models"]["stt"])
+
+    def test_kokoro_concurrent_requests_serialized_by_lock(self):
+        """Verifica que llamadas concurrentes con Kokoro se serialicen mediante _espeak_piper_lock evitando carreras en espeak-ng."""
+        active_calls = 0
+        max_concurrent_calls = 0
+        call_lock = threading.Lock()
+        results = []
+
+        def mock_create(text, voice=None, speed=1.0, lang="es"):
+            nonlocal active_calls, max_concurrent_calls
+            with call_lock:
+                active_calls += 1
+                if active_calls > max_concurrent_calls:
+                    max_concurrent_calls = active_calls
+            # Pausa artificial para forzar colisión si no existiese el lock global
+            time.sleep(0.04)
+            with call_lock:
+                active_calls -= 1
+            return np.zeros(2400, dtype=np.float32), 24000
+
+        mock_kokoro = MagicMock()
+        mock_kokoro.get_voices.return_value = ["jf_alpha", "ef_dora"]
+        mock_kokoro.create.side_effect = mock_create
+
+        def run_worker(text_payload):
+            wav, metrics = tts_router._synthesize_wav_sync(
+                text=text_payload,
+                voice_id="jf_alpha",
+                speed=1.0,
+                language="es",
+                pitch_semitones=2.0,
+                model="kokoro"
+            )
+            results.append((wav, metrics))
+
+        with patch.dict(os.environ, {"SENSORY_TIER": "full"}):
+            with patch.object(tts_router, "get_kokoro_voice", return_value=mock_kokoro):
+                t1 = threading.Thread(target=run_worker, args=("Primera oración de prueba concurrente.",))
+                t2 = threading.Thread(target=run_worker, args=("Segunda oración de prueba concurrente.",))
+
+                t1.start()
+                t2.start()
+                t1.join()
+                t2.join()
+
+        # Ambas síntesis deben haber culminado con éxito
+        self.assertEqual(len(results), 2)
+        for wav, metrics in results:
+            self.assertEqual(metrics["engine"], "kokoro")
+            self.assertGreater(len(wav), 44)
+
+        # La concurrencia máxima en kokoro.create debe ser estrictamente 1 (cero carreras)
+        self.assertEqual(max_concurrent_calls, 1, f"Condición de carrera detectada: max concurrent={max_concurrent_calls}")
+
+        # Al menos uno de los hilos debió registrar tiempo de espera de lock (> 0ms)
+        lock_waits = [metrics["lock_wait_ms"] for _, metrics in results]
+        self.assertTrue(any(w > 10.0 for w in lock_waits), f"Ningún hilo esperó en cola de lock: {lock_waits}")
+
+    def test_ef_dora_pure_spanish_resolution_and_zero_default_pitch(self):
+        """Verifica que ef_dora resuelva pura sin mezcla y use pitch 0.0 por defecto en /tts y /v1/audio/speech."""
+        mock_kokoro = MagicMock()
+        mock_kokoro.get_voices.return_value = ["ef_dora", "jf_alpha"]
+        mock_kokoro.get_voice_style.return_value = np.ones((510, 1, 256), dtype=np.float32)
+
+        # 1. Resolución pura de ef_dora
+        resolved = tts_router._resolve_kokoro_voice(mock_kokoro, "ef_dora", "es")
+        self.assertEqual(resolved, "ef_dora")
+        self.assertIsInstance(resolved, str)
+        # get_voice_style no debe llamarse para ef_dora
+        mock_kokoro.get_voice_style.assert_not_called()
+
+        # Comparar con ef_blend o jf_alpha que sí deben mezclar
+        blended = tts_router._resolve_kokoro_voice(mock_kokoro, "ef_blend", "es")
+        self.assertIsInstance(blended, np.ndarray)
+        self.assertTrue(mock_kokoro.get_voice_style.called)
+
+        # 2. Pitch 0.0 por defecto en /tts para ef_dora sin pitch explícito
+        dummy_wav = tts_router._generate_wav_bytes(b"\x00" * 4410, sample_rate=24000)
+        fake_metrics = {
+            "voice": "ef_dora",
+            "engine": "kokoro",
+            "lang": "es",
+            "chars": 4,
+            "lock_wait_ms": 0.0,
+            "infer_ms": 10.0,
+            "audio_dur_ms": 100.0,
+            "bytes": len(dummy_wav)
+        }
+        with patch.dict(os.environ, {"SENSORY_TIER": "full"}):
+            with patch.object(tts_router, "_synthesize_wav_sync", return_value=(dummy_wav, fake_metrics)) as mock_synth:
+                # /tts con ef_dora sin pitch_semitones
+                resp_dora = self.client.post("/tts", json={"voice": "ef_dora", "text": "Hola, soy Dora."})
+                self.assertEqual(resp_dora.status_code, 200)
+                args_dora, kwargs_dora = mock_synth.call_args
+                passed_pitch_dora = args_dora[4] if len(args_dora) > 4 else kwargs_dora.get("pitch_semitones")
+                self.assertEqual(passed_pitch_dora, 0.0)
+
+                mock_synth.reset_mock()
+                # /tts con voz anime jf_alpha sin pitch explícito -> mantiene 2.0
+                resp_anime = self.client.post("/tts", json={"voice": "jf_alpha", "text": "Konnichiwa!"})
+                self.assertEqual(resp_anime.status_code, 200)
+                args_anime, kwargs_anime = mock_synth.call_args
+                passed_pitch_anime = args_anime[4] if len(args_anime) > 4 else kwargs_anime.get("pitch_semitones")
+                self.assertEqual(passed_pitch_anime, 2.0)
+
+                mock_synth.reset_mock()
+                # /v1/audio/speech con ef_dora sin pitch explícito -> usa 0.0
+                resp_speech = self.client.post("/v1/audio/speech", json={"voice": "ef_dora", "input": "Hola, soy Dora."})
+                self.assertEqual(resp_speech.status_code, 200)
+                args_speech, kwargs_speech = mock_synth.call_args
+                passed_pitch_speech = args_speech[4] if len(args_speech) > 4 else kwargs_speech.get("pitch_semitones")
+                self.assertEqual(passed_pitch_speech, 0.0)
+
+                mock_synth.reset_mock()
+                # /tts con ef_dora con pitch_semitones explícito -> respeta el valor explícito
+                resp_explicit = self.client.post("/tts", json={"voice": "ef_dora", "text": "Hola", "pitch_semitones": 1.2})
+                self.assertEqual(resp_explicit.status_code, 200)
+                args_exp, kwargs_exp = mock_synth.call_args
+                passed_pitch_exp = args_exp[4] if len(args_exp) > 4 else kwargs_exp.get("pitch_semitones")
+                self.assertEqual(passed_pitch_exp, 1.2)
 
 
 if __name__ == "__main__":

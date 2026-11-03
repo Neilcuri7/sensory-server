@@ -140,6 +140,7 @@ def _detect_phoneme_lang(text: str, voice_id: str, requested_lang: Optional[str]
 def _resolve_kokoro_voice(kokoro_instance, voice_id: str, lang: str):
     """
     Resuelve la voz para Kokoro ONNX:
+    - Si voice_id == 'ef_dora': retorna directamente 'ef_dora' si está en available (voz española pura).
     - Si lang == 'es' y voice_id en ('ef_blend', 'jf_alpha') o jf_*:
       mezcla linealmente el estilo neuronal español de 'ef_dora' con el timbre anime de 'jf_alpha' (o voice_id).
     - Mantiene compatibilidad con mocks de test unitarios.
@@ -154,6 +155,10 @@ def _resolve_kokoro_voice(kokoro_instance, voice_id: str, lang: str):
 
     if not isinstance(available, (list, tuple, set)):
         return voice_id
+
+    # Si se solicita ef_dora, devolverla directamente pura sin mezcla lineal innecesaria
+    if voice_id == "ef_dora" and "ef_dora" in available:
+        return "ef_dora"
 
     if lang == "es":
         target_anime = "jf_alpha" if voice_id in ("ef_blend", "jf_alpha") else voice_id
@@ -371,7 +376,7 @@ class SpeechRequest(BaseModel):
     language: Optional[str] = Field(default="es", description="Idioma fonético ('es', 'ja', 'en-us').")
     response_format: Optional[str] = Field(default="wav", description="Formato de salida ('wav').")
     speed: Optional[float] = Field(default=1.05, description="Velocidad de reproducción (0.25 a 4.0).")
-    pitch_semitones: Optional[float] = Field(default=2.0, description="Modificación de tono en semitonos (ej. +2.0 anime).")
+    pitch_semitones: Optional[float] = Field(default=None, description="Modificación de tono en semitonos (ej. +2.0 anime, 0.0 natural).")
     sequence_id: Optional[int] = Field(default=0, description="ID secuencial de streaming de audio.")
 
 
@@ -455,10 +460,10 @@ def _synthesize_wav_sync(
     voice_id: str,
     speed: float,
     language: Optional[str] = "es",
-    pitch_semitones: float = 2.0,
+    pitch_semitones: Optional[float] = None,
     model: Optional[str] = None,
 ) -> tuple[bytes, dict]:
-    """Función de síntesis síncrona thread-safe con concurrencia fina para Kokoro y lock para Piper."""
+    """Función de síntesis síncrona thread-safe serializada mediante lock global espeak/piper para Kokoro y Piper."""
     tier = get_sensory_tier()
     lock_wait_ms = 0.0
     clean_text = _sanitize_text_for_tts(text)
@@ -493,6 +498,13 @@ def _synthesize_wav_sync(
     detected_lang = "es" if is_piper else _detect_phoneme_lang(clean_text, target_voice, requested_lang=language)
     engine_used = "fallback"
 
+    if pitch_semitones is not None:
+        effective_pitch = float(pitch_semitones)
+    elif target_voice == "ef_dora":
+        effective_pitch = 0.0
+    else:
+        effective_pitch = 2.0
+
     t_infer_start = time.perf_counter()
     wav_bytes = None
     onnx_ms = 0.0
@@ -502,7 +514,7 @@ def _synthesize_wav_sync(
     if is_piper:
         t_lock_start = time.perf_counter()
         with _espeak_piper_lock:
-            lock_wait_ms = (time.perf_counter() - t_lock_start) * 1000.0
+            lock_wait_ms += (time.perf_counter() - t_lock_start) * 1000.0
             voice = get_piper_voice()
             if voice is not None:
                 try:
@@ -529,9 +541,9 @@ def _synthesize_wav_sync(
                             np.frombuffer(audio_frames, dtype=np.int16).astype(np.float32) / 32767.0
                         )
                         t_dsp_start = time.perf_counter()
-                        if abs(pitch_semitones) >= 0.05:
+                        if abs(effective_pitch) >= 0.05:
                             raw_samples = _apply_anime_pitch_shift(
-                                raw_samples, sample_rate, pitch_semitones
+                                raw_samples, sample_rate, effective_pitch
                             )
                         dsp_ms = (time.perf_counter() - t_dsp_start) * 1000.0
                         wav_bytes = _write_wav_bytes(raw_samples, sample_rate=sample_rate)
@@ -543,52 +555,60 @@ def _synthesize_wav_sync(
 
         # Fallback a Kokoro si Piper no estuviese listo (solo en full tier)
         if wav_bytes is None and tier != "light":
+            t_lock_start = time.perf_counter()
+            with _espeak_piper_lock:
+                lock_wait_ms += (time.perf_counter() - t_lock_start) * 1000.0
+                kokoro = get_kokoro_voice()
+                if kokoro is not None:
+                    try:
+                        t_onnx_start = time.perf_counter()
+                        resolved_voice = _resolve_kokoro_voice(kokoro, "jf_alpha", "es")
+                        samples, sample_rate = kokoro.create(
+                            clean_text,
+                            voice=resolved_voice,
+                            speed=user_speed,
+                            lang="es"
+                        )
+                        onnx_ms = (time.perf_counter() - t_onnx_start) * 1000.0
+                        t_dsp_start = time.perf_counter()
+                        if abs(effective_pitch) >= 0.05:
+                            samples = _apply_anime_pitch_shift(samples, sample_rate, effective_pitch)
+                        dsp_ms = (time.perf_counter() - t_dsp_start) * 1000.0
+                        wav_bytes = _write_wav_bytes(samples, sample_rate=sample_rate)
+                        engine_used = "kokoro"
+                    except Exception as e:
+                        logger.warning(f"Fallback Kokoro también falló: {e}")
+    else:
+        # 1. Kokoro ONNX (Estándar de Alta Fidelidad - Serializado con _espeak_piper_lock para proteger libespeak-ng)
+        t_lock_start = time.perf_counter()
+        with _espeak_piper_lock:
+            lock_wait_ms += (time.perf_counter() - t_lock_start) * 1000.0
             kokoro = get_kokoro_voice()
             if kokoro is not None:
                 try:
                     t_onnx_start = time.perf_counter()
-                    resolved_voice = _resolve_kokoro_voice(kokoro, "jf_alpha", "es")
+                    resolved_voice = _resolve_kokoro_voice(kokoro, target_voice, detected_lang)
                     samples, sample_rate = kokoro.create(
                         clean_text,
                         voice=resolved_voice,
                         speed=user_speed,
-                        lang="es"
+                        lang=detected_lang
                     )
                     onnx_ms = (time.perf_counter() - t_onnx_start) * 1000.0
                     t_dsp_start = time.perf_counter()
-                    if abs(pitch_semitones) >= 0.05:
-                        samples = _apply_anime_pitch_shift(samples, sample_rate, pitch_semitones)
+                    if abs(effective_pitch) >= 0.05:
+                        samples = _apply_anime_pitch_shift(samples, sample_rate, effective_pitch)
                     dsp_ms = (time.perf_counter() - t_dsp_start) * 1000.0
                     wav_bytes = _write_wav_bytes(samples, sample_rate=sample_rate)
                     engine_used = "kokoro"
                 except Exception as e:
-                    logger.warning(f"Fallback Kokoro también falló: {e}")
-    else:
-        # 1. Kokoro ONNX (Estándar de Alta Fidelidad - Ejecución concurrente no bloqueante)
-        kokoro = get_kokoro_voice()
-        if kokoro is not None:
-            try:
-                t_onnx_start = time.perf_counter()
-                resolved_voice = _resolve_kokoro_voice(kokoro, target_voice, detected_lang)
-                samples, sample_rate = kokoro.create(
-                    clean_text,
-                    voice=resolved_voice,
-                    speed=user_speed,
-                    lang=detected_lang
-                )
-                onnx_ms = (time.perf_counter() - t_onnx_start) * 1000.0
-                t_dsp_start = time.perf_counter()
-                if abs(pitch_semitones) >= 0.05:
-                    samples = _apply_anime_pitch_shift(samples, sample_rate, pitch_semitones)
-                dsp_ms = (time.perf_counter() - t_dsp_start) * 1000.0
-                wav_bytes = _write_wav_bytes(samples, sample_rate=sample_rate)
-                engine_used = "kokoro"
-            except Exception as e:
-                logger.warning(f"Kokoro ONNX falló durante síntesis, probando Piper como fallback: {e}")
+                    logger.warning(f"Kokoro ONNX falló durante síntesis, probando Piper como fallback: {e}")
 
         # 2. Piper TTS (Fallback si Kokoro no está listo o falló)
         if wav_bytes is None:
+            t_lock_start = time.perf_counter()
             with _espeak_piper_lock:
+                lock_wait_ms += (time.perf_counter() - t_lock_start) * 1000.0
                 voice = get_piper_voice()
                 if voice is not None:
                     try:
@@ -615,9 +635,9 @@ def _synthesize_wav_sync(
                                 np.frombuffer(audio_frames, dtype=np.int16).astype(np.float32) / 32767.0
                             )
                             t_dsp_start = time.perf_counter()
-                            if abs(pitch_semitones) >= 0.05:
+                            if abs(effective_pitch) >= 0.05:
                                 raw_samples = _apply_anime_pitch_shift(
-                                    raw_samples, sample_rate, pitch_semitones
+                                    raw_samples, sample_rate, effective_pitch
                                 )
                             dsp_ms = (time.perf_counter() - t_dsp_start) * 1000.0
                             wav_bytes = _write_wav_bytes(raw_samples, sample_rate=sample_rate)
@@ -677,13 +697,20 @@ async def generate_speech(req: SpeechRequest):
     elif not voice_id:
         voice_id = "jf_alpha"
 
+    if req.pitch_semitones is not None:
+        pitch = float(req.pitch_semitones)
+    elif voice_id == "ef_dora":
+        pitch = 0.0
+    else:
+        pitch = 2.0
+
     wav_bytes, metrics = await asyncio.to_thread(
         _synthesize_wav_sync,
         text,
         voice_id,
         float(req.speed or 1.05),
         req.language or "es",
-        float(req.pitch_semitones if req.pitch_semitones is not None else 2.0),
+        pitch,
         model=model_req
     )
     logger.info(
@@ -724,7 +751,12 @@ async def tts_endpoint(req: SpeechRequest):
         voice_id = "jf_alpha"
 
     speed = float(req.speed or 1.05)
-    pitch = float(req.pitch_semitones if req.pitch_semitones is not None else 2.0)
+    if req.pitch_semitones is not None:
+        pitch = float(req.pitch_semitones)
+    elif voice_id == "ef_dora":
+        pitch = 0.0
+    else:
+        pitch = 2.0
     lang = req.language or "es"
 
     wav_bytes, metrics = await asyncio.to_thread(
