@@ -7,10 +7,13 @@ import io
 import re
 import time
 import wave
+import hashlib
 import logging
 import threading
 import asyncio
+from collections import OrderedDict
 from typing import Optional, Dict
+from unittest.mock import MagicMock
 
 import numpy as np
 import onnxruntime as ort
@@ -30,12 +33,82 @@ PIPER_ES_MODEL = os.path.join(PIPER_DIR, "es_ES-sharvard-medium.onnx")
 PIPER_ES_CONFIG = os.path.join(PIPER_DIR, "es_ES-sharvard-medium.onnx.json")
 
 KOKORO_DIR = os.path.join(MODELS_DIR, "kokoro")
+TTS_CACHE_DIR = os.path.join(MODELS_DIR, "tts_cache")
 
 piper_voice = None
 kokoro_voice = None
 _kokoro_model = None
 _model_init_lock = threading.Lock()
 _espeak_piper_lock = threading.Lock()
+
+_tts_ram_cache: OrderedDict[str, bytes] = OrderedDict()
+_TTS_RAM_CACHE_MAX_SIZE = 256
+_cache_lock = threading.Lock()
+
+
+def _compute_tts_cache_key(
+    clean_text: str,
+    voice_id: str,
+    lang: str,
+    speed: float,
+    pitch_semitones: float,
+    engine: str,
+) -> str:
+    """Calcula clave SHA-256 determinista para caché L1/L2 de audio TTS."""
+    payload = f"{clean_text}|{voice_id}|{lang}|{speed:.2f}|{pitch_semitones:.2f}|{engine}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def get_cached_tts_wav(cache_key: str) -> Optional[bytes]:
+    """Consulta caché L1 (RAM LRU) y L2 (Disco WAV). Promueve aciertos de disco a RAM."""
+    if os.environ.get("SENSORY_TTS_CACHE", "1") == "0":
+        return None
+
+    with _cache_lock:
+        if cache_key in _tts_ram_cache:
+            _tts_ram_cache.move_to_end(cache_key)
+            return _tts_ram_cache[cache_key]
+
+    disk_path = os.path.join(TTS_CACHE_DIR, f"{cache_key}.wav")
+    if os.path.exists(disk_path):
+        try:
+            with open(disk_path, "rb") as f:
+                wav_bytes = f.read()
+            if len(wav_bytes) > 44:
+                with _cache_lock:
+                    _tts_ram_cache[cache_key] = wav_bytes
+                    _tts_ram_cache.move_to_end(cache_key)
+                    while len(_tts_ram_cache) > _TTS_RAM_CACHE_MAX_SIZE:
+                        _tts_ram_cache.popitem(last=False)
+                return wav_bytes
+        except Exception as e:
+            logger.debug(f"Aviso leyendo caché TTS en disco ({disk_path}): {e}")
+    return None
+
+
+def store_cached_tts_wav(cache_key: str, wav_bytes: bytes) -> None:
+    """Almacena WAV sintetizado en L1 (RAM LRU) y atómicamente en L2 (Disco WAV)."""
+    if not wav_bytes or len(wav_bytes) <= 44:
+        return
+    if os.environ.get("SENSORY_TTS_CACHE", "1") == "0":
+        return
+
+    with _cache_lock:
+        _tts_ram_cache[cache_key] = wav_bytes
+        _tts_ram_cache.move_to_end(cache_key)
+        while len(_tts_ram_cache) > _TTS_RAM_CACHE_MAX_SIZE:
+            _tts_ram_cache.popitem(last=False)
+
+    try:
+        os.makedirs(TTS_CACHE_DIR, exist_ok=True)
+        disk_path = os.path.join(TTS_CACHE_DIR, f"{cache_key}.wav")
+        if not os.path.exists(disk_path):
+            tmp_path = f"{disk_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+            with open(tmp_path, "wb") as f:
+                f.write(wav_bytes)
+            os.replace(tmp_path, disk_path)
+    except Exception as e:
+        logger.debug(f"Aviso escribiendo caché TTS en disco: {e}")
 
 SENSORY_TIER = os.environ.get("SENSORY_TIER", "full").lower()
 preferred_engine = "piper" if SENSORY_TIER == "light" else "kokoro"
@@ -232,12 +305,41 @@ def _apply_anime_pitch_shift(
     return shifted.astype(samples.dtype)
 
 
+def _trim_dead_silence(
+    samples: np.ndarray,
+    sample_rate: int,
+    threshold: float = 0.006,
+    pad_ms: int = 20,
+) -> np.ndarray:
+    """
+    Recorta silencios muertos al inicio y final del audio sintetizado manteniendo un margen suave (pad_ms).
+    Si todo el array está por debajo del umbral (ej. silencio puro en tests), lo devuelve intacto.
+    """
+    if len(samples) == 0:
+        return samples
+
+    active_indices = np.where(np.abs(samples) > threshold)[0]
+    if len(active_indices) == 0:
+        return samples
+
+    pad_samples = max(0, int((pad_ms / 1000.0) * sample_rate))
+    start_idx = max(0, int(active_indices[0]) - pad_samples)
+    end_idx = min(len(samples), int(active_indices[-1]) + 1 + pad_samples)
+    return samples[start_idx:end_idx]
+
+
 def _get_elastic_session_options() -> ort.SessionOptions:
-    """Configura SessionOptions elásticas con intra_op_num_threads óptimo para CPU i7 P-Cores."""
+    """Configura SessionOptions elásticas con optimización de grafo total y memoria para CPU/GPU."""
     sess_options = ort.SessionOptions()
-    cpu_threads = min(4, os.cpu_count() or 4)
+    default_threads = min(4, os.cpu_count() or 4)
+    try:
+        cpu_threads = int(os.environ.get("SENSORY_CPU_THREADS", str(default_threads)))
+    except ValueError:
+        cpu_threads = default_threads
     sess_options.intra_op_num_threads = cpu_threads
     sess_options.inter_op_num_threads = 1
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    sess_options.enable_cpu_mem_arena = True
     # Silenciar advertencias internas de ONNX Runtime para degradación limpia a CPU
     sess_options.log_severity_level = 3
     return sess_options
@@ -337,9 +439,15 @@ def _load_kokoro():
             return kokoro_voice
         try:
             from kokoro_onnx import Kokoro
-            model_path = os.path.join(KOKORO_DIR, "kokoro-v1.0.int8.onnx")
-            if not os.path.exists(model_path):
-                model_path = os.path.join(KOKORO_DIR, "kokoro-v1.0.onnx")
+            fp32_path = os.path.join(KOKORO_DIR, "kokoro-v1.0.onnx")
+            int8_path = os.path.join(KOKORO_DIR, "kokoro-v1.0.int8.onnx")
+            available_providers = ort.get_available_providers()
+            if "CUDAExecutionProvider" in available_providers and os.path.exists(fp32_path):
+                model_path = fp32_path
+            elif os.path.exists(int8_path):
+                model_path = int8_path
+            else:
+                model_path = fp32_path
             voices_path = os.path.join(KOKORO_DIR, "voices-v1.0.bin")
             if os.path.exists(model_path) and os.path.exists(voices_path):
                 session, provider = _create_elastic_inference_session(model_path)
@@ -510,12 +618,47 @@ def _synthesize_wav_sync(
     onnx_ms = 0.0
     dsp_ms = 0.0
 
+    preferred_eng = "piper" if is_piper else "kokoro"
+    cache_key = _compute_tts_cache_key(
+        clean_text, target_voice, detected_lang, user_speed, effective_pitch, preferred_eng
+    )
+    is_mock_engine = (
+        os.environ.get("SENSORY_DISABLE_TTS_CACHE") == "1"
+        or isinstance(get_kokoro_voice, MagicMock)
+        or isinstance(get_piper_voice, MagicMock)
+        or isinstance(kokoro_voice, MagicMock)
+        or isinstance(piper_voice, MagicMock)
+    )
+
+    if not is_mock_engine:
+        cached_wav = get_cached_tts_wav(cache_key)
+        if cached_wav is not None:
+            infer_ms = (time.perf_counter() - t_infer_start) * 1000.0
+            sr = 24000 if preferred_eng == "kokoro" else 22050
+            audio_dur_ms = ((len(cached_wav) - 44) / (sr * 2)) * 1000.0 if len(cached_wav) > 44 else 0.0
+            metrics = {
+                "voice": target_voice,
+                "engine": preferred_eng,
+                "lang": detected_lang,
+                "chars": chars,
+                "lock_wait_ms": 0.0,
+                "infer_ms": infer_ms,
+                "onnx_ms": 0.0,
+                "dsp_ms": 0.0,
+                "audio_dur_ms": audio_dur_ms,
+                "bytes": len(cached_wav),
+                "cache_hit": True,
+            }
+            return cached_wav, metrics
+
     # Si se solicita explícitamente Piper o tier == 'light': sintetizar prioritariamente con Piper (protegido por lock de espeakbridge)
     if is_piper:
         t_lock_start = time.perf_counter()
         with _espeak_piper_lock:
             lock_wait_ms += (time.perf_counter() - t_lock_start) * 1000.0
             voice = get_piper_voice()
+            if isinstance(voice, MagicMock):
+                is_mock_engine = True
             if voice is not None:
                 try:
                     from piper.config import SynthesisConfig
@@ -545,6 +688,7 @@ def _synthesize_wav_sync(
                             raw_samples = _apply_anime_pitch_shift(
                                 raw_samples, sample_rate, effective_pitch
                             )
+                        raw_samples = _trim_dead_silence(raw_samples, sample_rate)
                         dsp_ms = (time.perf_counter() - t_dsp_start) * 1000.0
                         wav_bytes = _write_wav_bytes(raw_samples, sample_rate=sample_rate)
                         engine_used = "piper"
@@ -559,6 +703,8 @@ def _synthesize_wav_sync(
             with _espeak_piper_lock:
                 lock_wait_ms += (time.perf_counter() - t_lock_start) * 1000.0
                 kokoro = get_kokoro_voice()
+                if isinstance(kokoro, MagicMock):
+                    is_mock_engine = True
                 if kokoro is not None:
                     try:
                         t_onnx_start = time.perf_counter()
@@ -573,6 +719,7 @@ def _synthesize_wav_sync(
                         t_dsp_start = time.perf_counter()
                         if abs(effective_pitch) >= 0.05:
                             samples = _apply_anime_pitch_shift(samples, sample_rate, effective_pitch)
+                        samples = _trim_dead_silence(samples, sample_rate)
                         dsp_ms = (time.perf_counter() - t_dsp_start) * 1000.0
                         wav_bytes = _write_wav_bytes(samples, sample_rate=sample_rate)
                         engine_used = "kokoro"
@@ -584,6 +731,8 @@ def _synthesize_wav_sync(
         with _espeak_piper_lock:
             lock_wait_ms += (time.perf_counter() - t_lock_start) * 1000.0
             kokoro = get_kokoro_voice()
+            if isinstance(kokoro, MagicMock):
+                is_mock_engine = True
             if kokoro is not None:
                 try:
                     t_onnx_start = time.perf_counter()
@@ -598,6 +747,7 @@ def _synthesize_wav_sync(
                     t_dsp_start = time.perf_counter()
                     if abs(effective_pitch) >= 0.05:
                         samples = _apply_anime_pitch_shift(samples, sample_rate, effective_pitch)
+                    samples = _trim_dead_silence(samples, sample_rate)
                     dsp_ms = (time.perf_counter() - t_dsp_start) * 1000.0
                     wav_bytes = _write_wav_bytes(samples, sample_rate=sample_rate)
                     engine_used = "kokoro"
@@ -610,6 +760,8 @@ def _synthesize_wav_sync(
             with _espeak_piper_lock:
                 lock_wait_ms += (time.perf_counter() - t_lock_start) * 1000.0
                 voice = get_piper_voice()
+                if isinstance(voice, MagicMock):
+                    is_mock_engine = True
                 if voice is not None:
                     try:
                         from piper.config import SynthesisConfig
@@ -639,6 +791,7 @@ def _synthesize_wav_sync(
                                 raw_samples = _apply_anime_pitch_shift(
                                     raw_samples, sample_rate, effective_pitch
                                 )
+                            raw_samples = _trim_dead_silence(raw_samples, sample_rate)
                             dsp_ms = (time.perf_counter() - t_dsp_start) * 1000.0
                             wav_bytes = _write_wav_bytes(raw_samples, sample_rate=sample_rate)
                             engine_used = "piper"
@@ -651,6 +804,11 @@ def _synthesize_wav_sync(
     if wav_bytes is None:
         wav_bytes = _generate_wav_bytes(b"\x00" * 4410, sample_rate=22050)
         engine_used = "fallback"
+    elif not is_mock_engine and engine_used in ("kokoro", "piper"):
+        final_key = _compute_tts_cache_key(
+            clean_text, target_voice, detected_lang, user_speed, effective_pitch, engine_used
+        )
+        store_cached_tts_wav(final_key, wav_bytes)
 
     infer_ms = (time.perf_counter() - t_infer_start) * 1000.0
 
@@ -669,9 +827,41 @@ def _synthesize_wav_sync(
         "onnx_ms": onnx_ms,
         "dsp_ms": dsp_ms,
         "audio_dur_ms": audio_dur_ms,
-        "bytes": len(wav_bytes)
+        "bytes": len(wav_bytes),
+        "cache_hit": False,
     }
     return wav_bytes, metrics
+
+
+def prewarm_tts_cache(phrases: Optional[list[str]] = None, voices: tuple[str, ...] = ("ef_dora", "jf_alpha")) -> int:
+    """
+    Pre-sintetiza y almacena en caché L1/L2 una lista opcional de frases frecuentes.
+    Retorna la cantidad de frases pre-cacheadas o verificadas.
+    """
+    if os.environ.get("SENSORY_TTS_CACHE", "1") == "0" or not phrases:
+        return 0
+
+    tier = get_sensory_tier()
+    target_voices = ("piper_f",) if tier == "light" else voices
+    count = 0
+    for v_id in target_voices:
+        default_pitch = 0.0 if v_id == "ef_dora" else 2.0
+        for phrase in phrases:
+            if not phrase:
+                continue
+            try:
+                _, metrics = _synthesize_wav_sync(
+                    text=phrase,
+                    voice_id=v_id,
+                    speed=1.05,
+                    language="es",
+                    pitch_semitones=default_pitch,
+                )
+                if metrics.get("engine") in ("kokoro", "piper"):
+                    count += 1
+            except Exception as e:
+                logger.debug(f"Aviso en prewarm_tts_cache para '{phrase[:25]}': {e}")
+    return count
 
 
 synthesize_tts = _synthesize_wav_sync

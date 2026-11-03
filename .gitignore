@@ -23,5 +23,6 @@ models/*.tar.bz2
 models/sherpa-onnx-*/*
 models/piper/*
 models/kokoro/*
+models/tts_cache/*
 models/vision/*
 !models/.gitkeep

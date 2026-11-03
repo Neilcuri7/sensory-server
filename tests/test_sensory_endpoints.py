@@ -451,6 +451,87 @@ class TestSensoryEndpoints(unittest.TestCase):
                 passed_pitch_exp = args_exp[4] if len(args_exp) > 4 else kwargs_exp.get("pitch_semitones")
                 self.assertEqual(passed_pitch_exp, 1.2)
 
+    def test_tts_l1_l2_cache_roundtrip_and_fast_hit(self):
+        """Verifica que el caché SHA-256 almacene en L1 RAM + L2 disco y sirva aciertos instantáneos sin adquirir lock."""
+        import tempfile
+        dummy_wav = tts_router._write_wav_bytes(np.ones(2400, dtype=np.float32) * 0.25, sample_rate=24000)
+
+        with tempfile.TemporaryDirectory() as tmp_cache_dir:
+            with patch.object(tts_router, "TTS_CACHE_DIR", tmp_cache_dir):
+                tts_router._tts_ram_cache.clear()
+                key = tts_router._compute_tts_cache_key("¡Hola! Aquí estoy contigo.", "ef_dora", "es", 1.05, 0.0, "kokoro")
+                self.assertIsNone(tts_router.get_cached_tts_wav(key))
+
+                # Guardar en L1 y L2
+                tts_router.store_cached_tts_wav(key, dummy_wav)
+                disk_file = os.path.join(tmp_cache_dir, f"{key}.wav")
+                self.assertTrue(os.path.exists(disk_file))
+
+                # L1 hit
+                hit_l1 = tts_router.get_cached_tts_wav(key)
+                self.assertEqual(hit_l1, dummy_wav)
+
+                # Limpiar L1 para verificar promoción desde L2 (disco)
+                tts_router._tts_ram_cache.clear()
+                hit_l2 = tts_router.get_cached_tts_wav(key)
+                self.assertEqual(hit_l2, dummy_wav)
+                self.assertIn(key, tts_router._tts_ram_cache)
+
+                # Verificar que _synthesize_wav_sync devuelva cache_hit=True en <2ms sin invocar inferencia
+                wav_out, metrics = tts_router._synthesize_wav_sync(
+                    text="¡Hola! Aquí estoy contigo.",
+                    voice_id="ef_dora",
+                    speed=1.05,
+                    language="es",
+                    pitch_semitones=0.0,
+                    model="kokoro"
+                )
+                self.assertEqual(wav_out, dummy_wav)
+                self.assertTrue(metrics.get("cache_hit"))
+                self.assertEqual(metrics.get("lock_wait_ms"), 0.0)
+                self.assertLess(metrics.get("infer_ms", 999.0), 5.0)
+                tts_router._tts_ram_cache.clear()
+
+    def test_trim_dead_silence_removes_padding_and_preserves_pure_zeros(self):
+        """Verifica que _trim_dead_silence recorte silencios extremos preservando 20ms de margen e ignore arrays puros de ceros."""
+        sr = 24000
+        # 1. Silencio puro (como en mocks): debe devolverse intacto sin recortar
+        pure_zeros = np.zeros(2400, dtype=np.float32)
+        trimmed_zeros = tts_router._trim_dead_silence(pure_zeros, sr)
+        self.assertEqual(len(trimmed_zeros), 2400)
+
+        # 2. Señal con 5000 muestras de silencio al inicio y 5000 al final, y 4000 activas en el centro
+        signal = np.concatenate([
+            np.zeros(5000, dtype=np.float32),
+            np.ones(4000, dtype=np.float32) * 0.5,
+            np.zeros(5000, dtype=np.float32),
+        ])
+        trimmed = tts_router._trim_dead_silence(signal, sr, threshold=0.006, pad_ms=20)
+        pad_samples = int(0.020 * sr)  # 480 muestras
+        expected_len = 4000 + 2 * pad_samples
+        self.assertEqual(len(trimmed), expected_len)
+
+    def test_stt_preprocess_audio_and_domain_lexicon_corrections(self):
+        """Verifica el acondicionamiento DSP (resample_poly + auto-gain) y la corrección fonética de 'Rylai'."""
+        # 1. Corrección fonética de variantes hispanas de Whisper
+        raw_transcript = "hola rilai, ¿cómo estás rilay? oye railai y raily"
+        corrected = stt_router._apply_domain_lexicon_corrections(raw_transcript)
+        self.assertEqual(corrected, "hola Rylai, ¿cómo estás Rylai? oye Rylai y Rylai")
+
+        # 2. Preprocesamiento de señal estéreo a 48kHz con volumen bajo (pico 0.10) y DC offset
+        sr_in = 48000
+        t = np.linspace(0, 0.5, sr_in // 2, dtype=np.float32)
+        quiet_sine = (np.sin(2 * np.pi * 440 * t) * 0.10) + 0.05  # pico ~0.10 + DC offset 0.05
+        stereo_signal = np.column_stack([quiet_sine, quiet_sine])
+
+        processed, sr_out = stt_router._preprocess_stt_audio(stereo_signal, sr_in)
+        self.assertEqual(sr_out, 16000)
+        self.assertEqual(len(processed.shape), 1)
+        self.assertAlmostEqual(float(np.mean(processed)), 0.0, places=2)
+        # Auto-gain debe haber elevado el pico cerca de 0.89
+        self.assertGreater(float(np.max(np.abs(processed))), 0.80)
+        self.assertLessEqual(float(np.max(np.abs(processed))), 0.95)
+
 
 if __name__ == "__main__":
     unittest.main()

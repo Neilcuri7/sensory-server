@@ -4,6 +4,8 @@ Ejecución asíncrona no bloqueante (threading) para alta concurrencia.
 """
 import os
 import io
+import re
+import math
 import time
 import logging
 import threading
@@ -24,8 +26,73 @@ WHISPER_BASE_ENCODER = os.path.join(WHISPER_BASE_DIR, "base-encoder.int8.onnx")
 WHISPER_BASE_DECODER = os.path.join(WHISPER_BASE_DIR, "base-decoder.int8.onnx")
 WHISPER_BASE_TOKENS = os.path.join(WHISPER_BASE_DIR, "base-tokens.txt")
 
+WHISPER_SMALL_DIR = os.path.join(MODELS_DIR, "sherpa-onnx-whisper-small")
+WHISPER_SMALL_ENCODER = os.path.join(WHISPER_SMALL_DIR, "small-encoder.int8.onnx")
+WHISPER_SMALL_DECODER = os.path.join(WHISPER_SMALL_DIR, "small-decoder.int8.onnx")
+WHISPER_SMALL_TOKENS = os.path.join(WHISPER_SMALL_DIR, "small-tokens.txt")
+
 recognizer = None
 _stt_lock = threading.Lock()
+
+_RYLAI_MISSPELLINGS_REGEX = re.compile(
+    r"\b(rilai|rilay|railai|raily|rylay|relai)\b",
+    re.IGNORECASE,
+)
+
+
+def _apply_domain_lexicon_corrections(text: str) -> str:
+    """Corrige transcripciones fonéticas hispanas frecuentes del nombre 'Rylai'."""
+    if not text:
+        return ""
+    return _RYLAI_MISSPELLINGS_REGEX.sub("Rylai", text)
+
+
+def _preprocess_stt_audio(data: np.ndarray, sample_rate: int) -> tuple[np.ndarray, int]:
+    """
+    Acondicionamiento DSP de señal previa a Whisper:
+    1. Conversión estéreo -> mono.
+    2. Remuestreo polifásico FIR anti-aliasing (resample_poly) a 16000 Hz.
+    3. Eliminación de componente continua (DC offset).
+    4. Normalización automática de ganancia (Peak Auto-Gain) para micrófonos con volumen bajo.
+    """
+    if len(data.shape) > 1:
+        data = np.mean(data, axis=1)
+
+    data = np.asarray(data, dtype=np.float32)
+
+    if sample_rate != 16000 and sample_rate > 0 and len(data) > 0:
+        import scipy.signal
+        gcd = math.gcd(16000, sample_rate)
+        up = 16000 // gcd
+        down = sample_rate // gcd
+        data = scipy.signal.resample_poly(data, up, down).astype(np.float32)
+        sample_rate = 16000
+
+    if len(data) > 0:
+        # Eliminar DC offset
+        data = data - float(np.mean(data))
+        # Auto-gain peak normalization (solo si hay señal activa y está por debajo del nivel óptimo)
+        peak = float(np.max(np.abs(data)))
+        if 0.015 <= peak < 0.85:
+            data = (data * (0.89 / peak)).astype(np.float32)
+
+    return data, sample_rate
+
+
+def _resolve_whisper_model_paths() -> tuple[str, str, str, str]:
+    """
+    Selecciona los pesos de Whisper (small si está instalado y habilitado, o base por defecto).
+    Retorna (encoder_path, decoder_path, tokens_path, model_label).
+    """
+    pref = os.environ.get("SENSORY_STT_MODEL", "auto").lower().strip()
+    small_exists = (
+        os.path.exists(WHISPER_SMALL_ENCODER)
+        and os.path.exists(WHISPER_SMALL_DECODER)
+        and os.path.exists(WHISPER_SMALL_TOKENS)
+    )
+    if pref in ("small", "whisper-small", "auto") and small_exists and pref != "base":
+        return WHISPER_SMALL_ENCODER, WHISPER_SMALL_DECODER, WHISPER_SMALL_TOKENS, "Whisper Small"
+    return WHISPER_BASE_ENCODER, WHISPER_BASE_DECODER, WHISPER_BASE_TOKENS, "Whisper Base"
 
 
 def get_recognizer():
@@ -35,9 +102,13 @@ def get_recognizer():
 
     try:
         import sherpa_onnx
-        if os.path.exists(WHISPER_BASE_ENCODER) and os.path.exists(WHISPER_BASE_DECODER) and os.path.exists(WHISPER_BASE_TOKENS):
-            # P-Core thread cap (Intel i7 14th gen: 4 threads for STT, 4 for TTS)
-            num_threads = min(4, os.cpu_count() or 4)
+        encoder_path, decoder_path, tokens_path, model_label = _resolve_whisper_model_paths()
+        if os.path.exists(encoder_path) and os.path.exists(decoder_path) and os.path.exists(tokens_path):
+            default_threads = min(4, os.cpu_count() or 4)
+            try:
+                num_threads = int(os.environ.get("SENSORY_CPU_THREADS", str(default_threads)))
+            except ValueError:
+                num_threads = default_threads
 
             # Detección elástica de acelerador GPU (CUDA)
             try:
@@ -46,16 +117,16 @@ def get_recognizer():
                 if "CUDAExecutionProvider" in available:
                     try:
                         recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
-                            encoder=WHISPER_BASE_ENCODER,
-                            decoder=WHISPER_BASE_DECODER,
-                            tokens=WHISPER_BASE_TOKENS,
+                            encoder=encoder_path,
+                            decoder=decoder_path,
+                            tokens=tokens_path,
                             num_threads=num_threads,
                             language="es",
                             task="transcribe",
                             debug=False,
                             provider="cuda"
                         )
-                        logger.info(f"Reconocedor Whisper Base ONNX inicializado con éxito [provider=cuda, threads={num_threads}].")
+                        logger.info(f"Reconocedor {model_label} ONNX inicializado con éxito [provider=cuda, threads={num_threads}].")
                         return recognizer
                     except Exception as e_cuda:
                         logger.info(f"GPU no disponible para STT ({e_cuda}), degradando limpiamente a CPU.")
@@ -63,19 +134,19 @@ def get_recognizer():
                 logger.debug(f"Aviso en detección de provider STT: {e_ort}")
 
             recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
-                encoder=WHISPER_BASE_ENCODER,
-                decoder=WHISPER_BASE_DECODER,
-                tokens=WHISPER_BASE_TOKENS,
+                encoder=encoder_path,
+                decoder=decoder_path,
+                tokens=tokens_path,
                 num_threads=num_threads,
                 language="es",
                 task="transcribe",
                 debug=False,
                 provider="cpu"
             )
-            logger.info(f"Reconocedor Whisper Base ONNX inicializado con éxito [provider=cpu, threads={num_threads}].")
+            logger.info(f"Reconocedor {model_label} ONNX inicializado con éxito [provider=cpu, threads={num_threads}].")
             return recognizer
         else:
-            logger.warning(f"Modelos Whisper Base no encontrados en {WHISPER_BASE_DIR}.")
+            logger.warning(f"Modelos Whisper no encontrados en {WHISPER_BASE_DIR}.")
             return None
     except Exception as e:
         logger.error(f"Error inicializando reconocedor STT: {e}")
@@ -99,23 +170,16 @@ def _transcribe_bytes_sync(audio_bytes: bytes) -> tuple[str, dict]:
         audio_file = io.BytesIO(audio_bytes)
         data, sample_rate = sf.read(audio_file, dtype="float32")
 
-        # Convertir a mono si es estéreo
-        if len(data.shape) > 1:
-            data = np.mean(data, axis=1)
+        raw_duration_sec = (
+            (data.shape[0] / float(sample_rate)) if (sample_rate > 0 and len(data) > 0) else 0.0
+        )
 
-        raw_duration_sec = len(data) / float(sample_rate) if sample_rate > 0 else 0.0
-
-        # Resamplear a 16kHz si es necesario
-        if sample_rate != 16000:
-            import scipy.signal
-            target_length = int(len(data) * 16000 / sample_rate)
-            data = scipy.signal.resample(data, target_length).astype(np.float32)
-            sample_rate = 16000
+        data, sample_rate = _preprocess_stt_audio(data, sample_rate)
 
         stream = rec.create_stream()
         stream.accept_waveform(sample_rate, data)
         rec.decode_stream(stream)
-        text = stream.result.text.strip()
+        text = _apply_domain_lexicon_corrections(stream.result.text.strip())
 
         infer_duration_sec = time.perf_counter() - t_infer_start
         rtf = (infer_duration_sec / raw_duration_sec) if raw_duration_sec > 0 else 0.0

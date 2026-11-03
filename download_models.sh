@@ -98,6 +98,23 @@ else
     fi
 fi
 
+# 4. Modelo STT de Alta Precisión Opcional: Sherpa-ONNX Whisper Small (~360 MB int8)
+if [ "$TIER" = "all" ] || [ "${SENSORY_STT_MODEL:-}" = "small" ]; then
+    WHISPER_SMALL_DIR="$MODELS_DIR/sherpa-onnx-whisper-small"
+    mkdir -p "$WHISPER_SMALL_DIR"
+    if [ ! -f "$WHISPER_SMALL_DIR/small-encoder.int8.onnx" ]; then
+        echo "Descargando Whisper Small ONNX (Alta precisión en español)..."
+        TAR_SMALL="$MODELS_DIR/whisper-small.tar.bz2"
+        curl -L --progress-bar -o "$TAR_SMALL" "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-small.tar.bz2"
+        echo "Extrayendo Whisper Small..."
+        tar -xjf "$TAR_SMALL" -C "$MODELS_DIR"
+        rm -f "$TAR_SMALL"
+        echo "Whisper Small listo."
+    else
+        echo "Whisper Small ya esta instalado."
+    fi
+fi
+
 echo "=========================================================="
 echo "Modelos sensoriales listos en $MODELS_DIR (Tier: $TIER)"
 echo "=========================================================="
