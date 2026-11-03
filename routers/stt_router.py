@@ -47,13 +47,39 @@ def _apply_domain_lexicon_corrections(text: str) -> str:
     return _RYLAI_MISSPELLINGS_REGEX.sub("Rylai", text)
 
 
+def _trim_stt_silence(
+    data: np.ndarray,
+    sample_rate: int = 16000,
+    threshold: float = 0.015,
+    pad_ms: int = 80,
+) -> np.ndarray:
+    """
+    Recorta silencios muertos al inicio y final antes de Whisper para acelerar inferencia.
+    Conserva pad_ms de margen (default 80ms = 1280 muestras a 16kHz).
+    Si todo el array es silencio o la señal activa recortada es menor a 0.1s (1600 muestras), conserva data intacto.
+    """
+    if len(data) == 0:
+        return data
+    active_indices = np.where(np.abs(data) > threshold)[0]
+    if len(active_indices) == 0:
+        return data
+    pad_samples = max(0, int((pad_ms / 1000.0) * sample_rate))
+    start_idx = max(0, int(active_indices[0]) - pad_samples)
+    end_idx = min(len(data), int(active_indices[-1]) + 1 + pad_samples)
+    trimmed = data[start_idx:end_idx]
+    if len(trimmed) < 1600:
+        return data
+    return trimmed
+
+
 def _preprocess_stt_audio(data: np.ndarray, sample_rate: int) -> tuple[np.ndarray, int]:
     """
     Acondicionamiento DSP de señal previa a Whisper:
     1. Conversión estéreo -> mono.
-    2. Remuestreo polifásico FIR anti-aliasing (resample_poly) a 16000 Hz.
+    2. Remuestreo lineal ultrarrápido con NumPy (np.interp) a 16000 Hz (sin scipy).
     3. Eliminación de componente continua (DC offset).
     4. Normalización automática de ganancia (Peak Auto-Gain) para micrófonos con volumen bajo.
+    5. Recorte de silencios muertos al inicio y final (_trim_stt_silence).
     """
     if len(data.shape) > 1:
         data = np.mean(data, axis=1)
@@ -61,11 +87,9 @@ def _preprocess_stt_audio(data: np.ndarray, sample_rate: int) -> tuple[np.ndarra
     data = np.asarray(data, dtype=np.float32)
 
     if sample_rate != 16000 and sample_rate > 0 and len(data) > 0:
-        import scipy.signal
-        gcd = math.gcd(16000, sample_rate)
-        up = 16000 // gcd
-        down = sample_rate // gcd
-        data = scipy.signal.resample_poly(data, up, down).astype(np.float32)
+        target_len = max(1, int(round(len(data) * 16000.0 / float(sample_rate))))
+        orig_idx = np.linspace(0.0, len(data) - 1, target_len, dtype=np.float32)
+        data = np.interp(orig_idx, np.arange(len(data), dtype=np.float32), data).astype(np.float32)
         sample_rate = 16000
 
     if len(data) > 0:
@@ -75,22 +99,24 @@ def _preprocess_stt_audio(data: np.ndarray, sample_rate: int) -> tuple[np.ndarra
         peak = float(np.max(np.abs(data)))
         if 0.015 <= peak < 0.85:
             data = (data * (0.89 / peak)).astype(np.float32)
+        # Recorte de silencio muerto antes de Whisper para acelerar inferencia
+        data = _trim_stt_silence(data, sample_rate=sample_rate)
 
     return data, sample_rate
 
 
 def _resolve_whisper_model_paths() -> tuple[str, str, str, str]:
     """
-    Selecciona los pesos de Whisper (small si está instalado y habilitado, o base por defecto).
+    Selecciona los pesos de Whisper (small si se solicita explícitamente, o base por defecto para máxima velocidad).
     Retorna (encoder_path, decoder_path, tokens_path, model_label).
     """
-    pref = os.environ.get("SENSORY_STT_MODEL", "auto").lower().strip()
+    pref = os.environ.get("SENSORY_STT_MODEL", "base").lower().strip()
     small_exists = (
         os.path.exists(WHISPER_SMALL_ENCODER)
         and os.path.exists(WHISPER_SMALL_DECODER)
         and os.path.exists(WHISPER_SMALL_TOKENS)
     )
-    if pref in ("small", "whisper-small", "auto") and small_exists and pref != "base":
+    if pref in ("small", "whisper-small") and small_exists:
         return WHISPER_SMALL_ENCODER, WHISPER_SMALL_DECODER, WHISPER_SMALL_TOKENS, "Whisper Small"
     return WHISPER_BASE_ENCODER, WHISPER_BASE_DECODER, WHISPER_BASE_TOKENS, "Whisper Base"
 

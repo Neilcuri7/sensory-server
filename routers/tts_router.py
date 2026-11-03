@@ -328,6 +328,22 @@ def _trim_dead_silence(
     return samples[start_idx:end_idx]
 
 
+def _apply_piper_warmth_eq(samples: np.ndarray, sample_rate: int = 22050) -> np.ndarray:
+    """
+    DSP de ecualización suave y calidez armónica para Piper (es_ES-sharvard-medium):
+    1. Filtro FIR deavivado/de-harshness suave (y[n] = 0.82 * x[n] + 0.18 * x[n-1]).
+    2. Presencia armónica suave (tanh) para eliminar asperezas metálicas VITS a 22.05kHz.
+    Preserva silencios puros (<1e-4) y longitud exacta.
+    """
+    if len(samples) < 32 or float(np.max(np.abs(samples))) < 1e-4:
+        return samples
+
+    kernel = np.array([0.82, 0.18], dtype=np.float32)
+    smoothed = np.convolve(samples, kernel, mode="same")
+    warmth = np.tanh(smoothed * 1.12) / np.tanh(1.12)
+    return warmth.astype(samples.dtype)
+
+
 def _get_elastic_session_options() -> ort.SessionOptions:
     """Configura SessionOptions elásticas con optimización de grafo total y memoria para CPU/GPU."""
     sess_options = ort.SessionOptions()
@@ -607,8 +623,11 @@ def _synthesize_wav_sync(
     engine_used = "fallback"
 
     if pitch_semitones is not None:
-        effective_pitch = float(pitch_semitones)
-    elif target_voice == "ef_dora":
+        if is_piper and voice_id not in ("piper_f", "piper_sharvard_f", "es_ES-sharvard-medium", "1", "sharvard", "sharvard-medium") and abs(float(pitch_semitones) - 2.0) < 1e-4:
+            effective_pitch = 0.0
+        else:
+            effective_pitch = float(pitch_semitones)
+    elif is_piper or target_voice in ("ef_dora", "piper_f"):
         effective_pitch = 0.0
     else:
         effective_pitch = 2.0
@@ -664,9 +683,17 @@ def _synthesize_wav_sync(
                     from piper.config import SynthesisConfig
                     length_scale = 1.0 / user_speed
                     try:
-                        syn_cfg = SynthesisConfig(speaker_id=1, length_scale=length_scale)
+                        syn_cfg = SynthesisConfig(
+                            speaker_id=1,
+                            length_scale=length_scale,
+                            noise_scale=0.50,
+                            noise_w_scale=0.65,
+                        )
                     except (TypeError, ValueError):
-                        syn_cfg = SynthesisConfig(speaker_id=1)
+                        try:
+                            syn_cfg = SynthesisConfig(speaker_id=1, length_scale=length_scale)
+                        except (TypeError, ValueError):
+                            syn_cfg = SynthesisConfig(speaker_id=1)
 
                     sample_rate = getattr(getattr(voice, "config", None), "sample_rate", 22050)
                     audio_frames = bytearray()
@@ -688,6 +715,7 @@ def _synthesize_wav_sync(
                             raw_samples = _apply_anime_pitch_shift(
                                 raw_samples, sample_rate, effective_pitch
                             )
+                        raw_samples = _apply_piper_warmth_eq(raw_samples, sample_rate)
                         raw_samples = _trim_dead_silence(raw_samples, sample_rate)
                         dsp_ms = (time.perf_counter() - t_dsp_start) * 1000.0
                         wav_bytes = _write_wav_bytes(raw_samples, sample_rate=sample_rate)
@@ -767,9 +795,17 @@ def _synthesize_wav_sync(
                         from piper.config import SynthesisConfig
                         length_scale = 1.0 / user_speed
                         try:
-                            syn_cfg = SynthesisConfig(speaker_id=1, length_scale=length_scale)
+                            syn_cfg = SynthesisConfig(
+                                speaker_id=1,
+                                length_scale=length_scale,
+                                noise_scale=0.50,
+                                noise_w_scale=0.65,
+                            )
                         except (TypeError, ValueError):
-                            syn_cfg = SynthesisConfig(speaker_id=1)
+                            try:
+                                syn_cfg = SynthesisConfig(speaker_id=1, length_scale=length_scale)
+                            except (TypeError, ValueError):
+                                syn_cfg = SynthesisConfig(speaker_id=1)
 
                         sample_rate = getattr(getattr(voice, "config", None), "sample_rate", 22050)
                         audio_frames = bytearray()
@@ -791,6 +827,7 @@ def _synthesize_wav_sync(
                                 raw_samples = _apply_anime_pitch_shift(
                                     raw_samples, sample_rate, effective_pitch
                                 )
+                            raw_samples = _apply_piper_warmth_eq(raw_samples, sample_rate)
                             raw_samples = _trim_dead_silence(raw_samples, sample_rate)
                             dsp_ms = (time.perf_counter() - t_dsp_start) * 1000.0
                             wav_bytes = _write_wav_bytes(raw_samples, sample_rate=sample_rate)
@@ -845,7 +882,7 @@ def prewarm_tts_cache(phrases: Optional[list[str]] = None, voices: tuple[str, ..
     target_voices = ("piper_f",) if tier == "light" else voices
     count = 0
     for v_id in target_voices:
-        default_pitch = 0.0 if v_id == "ef_dora" else 2.0
+        default_pitch = 0.0 if v_id in ("ef_dora", "piper_f") else 2.0
         for phrase in phrases:
             if not phrase:
                 continue
@@ -888,8 +925,11 @@ async def generate_speech(req: SpeechRequest):
         voice_id = "jf_alpha"
 
     if req.pitch_semitones is not None:
-        pitch = float(req.pitch_semitones)
-    elif voice_id == "ef_dora":
+        if (tier == "light" or model_req == "piper") and req.voice not in ("piper_f", "piper_sharvard_f", "es_ES-sharvard-medium") and abs(float(req.pitch_semitones) - 2.0) < 1e-4:
+            pitch = 0.0
+        else:
+            pitch = float(req.pitch_semitones)
+    elif voice_id in ("ef_dora", "piper_f", "piper_sharvard_f", "es_ES-sharvard-medium") or model_req == "piper" or tier == "light":
         pitch = 0.0
     else:
         pitch = 2.0
@@ -942,8 +982,11 @@ async def tts_endpoint(req: SpeechRequest):
 
     speed = float(req.speed or 1.05)
     if req.pitch_semitones is not None:
-        pitch = float(req.pitch_semitones)
-    elif voice_id == "ef_dora":
+        if (tier == "light" or model_req == "piper") and req.voice not in ("piper_f", "piper_sharvard_f", "es_ES-sharvard-medium") and abs(float(req.pitch_semitones) - 2.0) < 1e-4:
+            pitch = 0.0
+        else:
+            pitch = float(req.pitch_semitones)
+    elif voice_id in ("ef_dora", "piper_f", "piper_sharvard_f", "es_ES-sharvard-medium") or model_req == "piper" or tier == "light":
         pitch = 0.0
     else:
         pitch = 2.0

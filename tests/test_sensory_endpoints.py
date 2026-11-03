@@ -532,6 +532,77 @@ class TestSensoryEndpoints(unittest.TestCase):
         self.assertGreater(float(np.max(np.abs(processed))), 0.80)
         self.assertLessEqual(float(np.max(np.abs(processed))), 0.95)
 
+    def test_piper_voice_defaults_to_zero_pitch(self):
+        """Verifica que piper_f use pitch 0.0 por defecto para evitar artefactos metálicos OLA."""
+        dummy_wav = tts_router._generate_wav_bytes(b"\x00" * 4410, sample_rate=22050)
+        fake_metrics = {
+            "voice": "piper_f",
+            "engine": "piper",
+            "lang": "es",
+            "chars": 4,
+            "lock_wait_ms": 0.0,
+            "infer_ms": 5.0,
+            "audio_dur_ms": 100.0,
+            "bytes": len(dummy_wav)
+        }
+
+        with patch.object(tts_router, "_synthesize_wav_sync", return_value=(dummy_wav, fake_metrics)) as mock_synth:
+            # 1. /tts con piper_f sin pitch explícito -> debe pasar pitch 0.0
+            resp_tts = self.client.post("/tts", json={"voice": "piper_f", "text": "Hola Piper"})
+            self.assertEqual(resp_tts.status_code, 200)
+            args, kwargs = mock_synth.call_args
+            passed_pitch = args[4] if len(args) > 4 else kwargs.get("pitch_semitones")
+            self.assertEqual(passed_pitch, 0.0)
+
+            mock_synth.reset_mock()
+            # 2. /v1/audio/speech con piper_f sin pitch explícito -> debe pasar pitch 0.0
+            resp_speech = self.client.post("/v1/audio/speech", json={"voice": "piper_f", "input": "Hola Piper"})
+            self.assertEqual(resp_speech.status_code, 200)
+            args, kwargs = mock_synth.call_args
+            passed_pitch = args[4] if len(args) > 4 else kwargs.get("pitch_semitones")
+            self.assertEqual(passed_pitch, 0.0)
+
+            mock_synth.reset_mock()
+            # 3. En tier light: petición con jf_alpha y pitch 2.0 (default anime de Kokoro) debe auto-anular el pitch a 0.0
+            with patch.dict(os.environ, {"SENSORY_TIER": "light"}):
+                resp_light = self.client.post("/tts", json={"voice": "jf_alpha", "text": "Hola", "pitch_semitones": 2.0})
+                self.assertEqual(resp_light.status_code, 200)
+                args, kwargs = mock_synth.call_args
+                passed_pitch = args[4] if len(args) > 4 else kwargs.get("pitch_semitones")
+                self.assertEqual(passed_pitch, 0.0)
+
+    def test_apply_piper_warmth_eq(self):
+        """Verifica que _apply_piper_warmth_eq ejecute en <2ms, preserve longitud/dtype y suavice transientes ásperas."""
+        sample_rate = 22050
+        # 1 segundo de audio sintético a 22.05kHz
+        samples = np.sin(2 * np.pi * 440 * np.linspace(0, 1, sample_rate, dtype=np.float32))
+
+        # Warm-up
+        tts_router._apply_piper_warmth_eq(samples, sample_rate)
+
+        # Benchmark < 2ms
+        t0 = time.perf_counter()
+        out = tts_router._apply_piper_warmth_eq(samples, sample_rate)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        self.assertLess(elapsed_ms, 2.0, f"Warmth EQ tardó {elapsed_ms:.2f}ms (>2.0ms)")
+
+        # Preservación estricta de longitud y tipo
+        self.assertEqual(len(out), len(samples))
+        self.assertEqual(out.dtype, samples.dtype)
+
+        # Silencio puro permanece intacto
+        silence = np.zeros(2048, dtype=np.float32)
+        out_silence = tts_router._apply_piper_warmth_eq(silence, sample_rate)
+        np.testing.assert_array_equal(out_silence, silence)
+
+        # Suavizado de transientes bruscas (escalón o impulso digital)
+        step = np.zeros(200, dtype=np.float32)
+        step[100:] = 1.0
+        smoothed = tts_router._apply_piper_warmth_eq(step, sample_rate)
+        max_jump_orig = float(np.max(np.abs(np.diff(step))))
+        max_jump_smoothed = float(np.max(np.abs(np.diff(smoothed))))
+        self.assertLess(max_jump_smoothed, max_jump_orig)
+
 
 if __name__ == "__main__":
     unittest.main()
