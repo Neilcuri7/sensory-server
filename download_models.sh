@@ -3,6 +3,7 @@
 # Sensory Server: Script de Descarga de Modelos
 # Descarga los pesos ONNX de Whisper Base (STT) y Piper Voice (TTS)
 # Soporta niveles de aprovisionamiento: --tier [light|full|all]
+# Opcional: --with-rvc (Descarga automáticamente las voces anime de Nino y Miku Nakano)
 # ==============================================================================
 set -e
 
@@ -10,6 +11,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODELS_DIR="$DIR/models"
 
 TIER="${SENSORY_TIER:-full}"
+WITH_RVC=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -21,8 +23,16 @@ while [[ $# -gt 0 ]]; do
       TIER="${1#*=}"
       shift 1
       ;;
+    --with-rvc)
+      WITH_RVC=true
+      shift 1
+      ;;
     -h|--help)
-      echo "Uso: $0 [--tier light|full|all]"
+      echo "Uso: $0 [--tier light|full|all] [--with-rvc]"
+      echo "  --tier light: Whisper Base + Piper (~185 MB)"
+      echo "  --tier full:  Whisper Base + Piper + Kokoro (~300 MB)"
+      echo "  --tier all:   Whisper Base + Whisper Small + Piper + Kokoro"
+      echo "  --with-rvc:   Descarga también las voces anime RVC de Nino y Miku Nakano (~120 MB)"
       exit 0
       ;;
     *)
@@ -112,6 +122,41 @@ if [ "$TIER" = "all" ] || [ "${SENSORY_STT_MODEL:-}" = "small" ]; then
         echo "Whisper Small listo."
     else
         echo "Whisper Small ya esta instalado."
+    fi
+fi
+
+# 5. Modelos RVC Opcionales: Nino y Miku Nakano (~120 MB en total)
+if [ "$WITH_RVC" = true ] || [ "$TIER" = "all" ]; then
+    echo "=========================================================="
+    echo "Descargando Voces Anime RVC v2 (Español Latino - 500e)..."
+    echo "=========================================================="
+    RVC_DIR="$MODELS_DIR/rvc"
+    mkdir -p "$RVC_DIR/Nino Nakano" "$RVC_DIR/Miku Nakano"
+
+    # Nino Nakano (500e)
+    if [ ! -f "$RVC_DIR/Nino Nakano/Nino Nakano.pth" ]; then
+        echo "Descargando Nino Nakano RVC v2..."
+        NINO_ZIP="$RVC_DIR/nino_tmp.zip"
+        curl -L --progress-bar -o "$NINO_ZIP" \
+            "https://drive.usercontent.google.com/download?id=1xzNybpSlRlHuBznkZN1JNOS9W7MZQSnd&export=download&confirm=t"
+        unzip -q -o "$NINO_ZIP" -d "$RVC_DIR/Nino Nakano/"
+        rm -f "$NINO_ZIP"
+        echo "Nino Nakano listo."
+    else
+        echo "Nino Nakano ya está instalado."
+    fi
+
+    # Miku Nakano (500e)
+    if [ ! -f "$RVC_DIR/Miku Nakano/Miku Nakano.index" ]; then
+        echo "Descargando Miku Nakano RVC v2..."
+        MIKU_ZIP="$RVC_DIR/miku_tmp.zip"
+        curl -L --progress-bar -o "$MIKU_ZIP" \
+            "https://drive.usercontent.google.com/download?id=1HJ6L35-ehufUQYkNfqq8WjQwwu3U_nb2&export=download&confirm=t"
+        unzip -q -o "$MIKU_ZIP" -d "$RVC_DIR/Miku Nakano/"
+        rm -f "$MIKU_ZIP"
+        echo "Miku Nakano listo."
+    else
+        echo "Miku Nakano ya está instalado."
     fi
 fi
 
