@@ -501,6 +501,7 @@ class SpeechRequest(BaseModel):
     response_format: Optional[str] = Field(default="wav", description="Formato de salida ('wav').")
     speed: Optional[float] = Field(default=1.05, description="Velocidad de reproducción (0.25 a 4.0).")
     pitch_semitones: Optional[float] = Field(default=None, description="Modificación de tono en semitonos (ej. +2.0 anime, 0.0 natural).")
+    rvc_voice: Optional[str] = Field(default=None, description="Voz Anime RVC opcional ('Nino Nakano', 'Miku Nakano', o 'none').")
     sequence_id: Optional[int] = Field(default=0, description="ID secuencial de streaming de audio.")
 
 
@@ -586,6 +587,7 @@ def _synthesize_wav_sync(
     language: Optional[str] = "es",
     pitch_semitones: Optional[float] = None,
     model: Optional[str] = None,
+    rvc_voice: Optional[str] = None,
 ) -> tuple[bytes, dict]:
     """Función de síntesis síncrona thread-safe serializada mediante lock global espeak/piper para Kokoro y Piper."""
     tier = get_sensory_tier()
@@ -638,8 +640,9 @@ def _synthesize_wav_sync(
     dsp_ms = 0.0
 
     preferred_eng = "piper" if is_piper else "kokoro"
+    cache_voice_id = f"{target_voice}+{rvc_voice}" if rvc_voice and rvc_voice.lower() not in ("none", "off") else target_voice
     cache_key = _compute_tts_cache_key(
-        clean_text, target_voice, detected_lang, user_speed, effective_pitch, preferred_eng
+        clean_text, cache_voice_id, detected_lang, user_speed, effective_pitch, preferred_eng
     )
     is_mock_engine = (
         os.environ.get("SENSORY_DISABLE_TTS_CACHE") == "1"
@@ -837,13 +840,30 @@ def _synthesize_wav_sync(
                     except Exception as e:
                         logger.error(f"Error sintetizando con Piper: {e}")
 
-    # 3. Fallback dummy silence si ningún motor está listo
+    # 3. Post-procesamiento opcional RVC Anime si fue solicitado
+    rvc_meta = {}
+    if wav_bytes is not None and rvc_voice and rvc_voice.lower() not in ("none", "off", "desactivado", "false"):
+        try:
+            from rvc_engine import apply_rvc_conversion
+            t_rvc_start = time.perf_counter()
+            wav_bytes, rvc_meta = apply_rvc_conversion(
+                wav_bytes=wav_bytes,
+                rvc_voice=rvc_voice,
+                pitch_semitones=effective_pitch,
+            )
+            dsp_ms += (time.perf_counter() - t_rvc_start) * 1000.0
+            if rvc_meta.get("rvc_applied"):
+                engine_used = f"{engine_used}+rvc"
+        except Exception as exc:
+            logger.error(f"[TTS] Error ejecutando pipeline RVC: {exc}")
+
+    # 4. Fallback dummy silence si ningún motor está listo
     if wav_bytes is None:
         wav_bytes = _generate_wav_bytes(b"\x00" * 4410, sample_rate=22050)
         engine_used = "fallback"
-    elif not is_mock_engine and engine_used in ("kokoro", "piper"):
+    elif not is_mock_engine and ("kokoro" in engine_used or "piper" in engine_used):
         final_key = _compute_tts_cache_key(
-            clean_text, target_voice, detected_lang, user_speed, effective_pitch, engine_used
+            clean_text, cache_voice_id, detected_lang, user_speed, effective_pitch, engine_used
         )
         store_cached_tts_wav(final_key, wav_bytes)
 
@@ -941,7 +961,8 @@ async def generate_speech(req: SpeechRequest):
         float(req.speed or 1.05),
         req.language or "es",
         pitch,
-        model=model_req
+        model=model_req,
+        rvc_voice=req.rvc_voice,
     )
     logger.info(
         f"[TTS Synthesis] voice='{metrics['voice']}' ({metrics['engine']}), lang='{metrics['lang']}', "
@@ -999,7 +1020,8 @@ async def tts_endpoint(req: SpeechRequest):
         speed,
         lang,
         pitch,
-        model=model_req
+        model=model_req,
+        rvc_voice=req.rvc_voice,
     )
     logger.info(
         f"[TTS Synthesis] voice='{metrics['voice']}' ({metrics['engine']}), lang='{metrics['lang']}', "
@@ -1114,6 +1136,13 @@ async def list_voices():
         "default_voice": default_voice,
         "default_engine": default_engine,
         "tier": tier,
+        "rvc_voices": [
+            {
+                "name": name,
+                "has_index": bool(info.index_path),
+            }
+            for name, info in __import__("rvc_engine").discover_rvc_models().items()
+        ],
         "engines": {
             "kokoro": {
                 "name": "Kokoro ONNX",
