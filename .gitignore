@@ -25,4 +25,7 @@ models/piper/*
 models/kokoro/*
 models/tts_cache/*
 models/vision/*
+models/rvc/*/*.pth
+models/rvc/*/*.index
+!models/rvc/.gitkeep
 !models/.gitkeep
