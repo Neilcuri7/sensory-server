@@ -158,6 +158,26 @@ if [ "$WITH_RVC" = true ] || [ "$TIER" = "all" ]; then
     else
         echo "Miku Nakano ya está instalado."
     fi
+
+    # 5.3 ContentVec 768-dim ONNX Feature Extractor (~150 MB)
+    if [ ! -f "$RVC_DIR/contentvec-f.onnx" ]; then
+        echo "Descargando ContentVec 768-dim ONNX..."
+        curl -L --progress-bar -o "$RVC_DIR/contentvec-f.onnx" \
+            "https://huggingface.co/wok000/weights_gpl/resolve/main/content-vec/contentvec-f.onnx"
+        echo "ContentVec ONNX listo."
+    else
+        echo "ContentVec ONNX ya está instalado."
+    fi
+
+    # 5.4 RMVPE Pitch Extractor ONNX (~16 MB)
+    if [ ! -f "$RVC_DIR/rmvpe.onnx" ]; then
+        echo "Descargando RMVPE Pitch Extractor ONNX..."
+        curl -L --progress-bar -o "$RVC_DIR/rmvpe.onnx" \
+            "https://huggingface.co/wok000/weights_gpl/resolve/main/rmvpe/rmvpe_20231006.onnx"
+        echo "RMVPE ONNX listo."
+    else
+        echo "RMVPE ONNX ya está instalado."
+    fi
 fi
 
 echo "=========================================================="

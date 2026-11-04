@@ -8,7 +8,17 @@ scipy>=1.11.0
 soundfile>=0.12.0
 rapidocr-onnxruntime>=1.3.0
 onnxruntime>=1.17.0
-# onnxruntime-gpu>=1.17.0  # Optional for CUDAExecutionProvider GPU acceleration (6GB VRAM arena capped)
+# onnxruntime-gpu>=1.17.0  # Optional for CUDAExecutionProvider GPU acceleration (GTX 1060 6GB VRAM arena capped)
 sherpa-onnx>=1.10.0
 piper-tts>=1.2.0
 kokoro-onnx>=0.4.0
+
+# ==============================================================================
+# RVC v2 Neural Engine (Tier 1 GPU/CPU Acceleration)
+# Optional: Install for full GPU (GTX 1060 6GB VRAM) or CPU neural synthesis.
+# Without these, the sensory server automatically uses Tier 2 DSP formant warping.
+# To enable Tier 1: pip install torch torchaudio faiss-cpu
+# ==============================================================================
+# torch>=2.2.0
+# torchaudio>=2.2.0
+# faiss-cpu>=1.7.4

@@ -54,9 +54,34 @@ def _compute_tts_cache_key(
     pitch_semitones: float,
     engine: str,
 ) -> str:
-    """Calcula clave SHA-256 determinista para caché L1/L2 de audio TTS."""
-    payload = f"{clean_text}|{voice_id}|{lang}|{speed:.2f}|{pitch_semitones:.2f}|{engine}"
+    """Calcula clave SHA-256 determinista para caché L1/L2 de audio TTS (salt v2)."""
+    payload = f"v2:{clean_text}|{voice_id}|{lang}|{speed:.2f}|{pitch_semitones:.2f}|{engine}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _get_wav_info(wav_bytes: bytes) -> tuple[int, int]:
+    """Extrae (sample_rate, num_frames) directamente de la cabecera WAV de forma robusta."""
+    if not wav_bytes or len(wav_bytes) < 44:
+        return (22050, 0)
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            return (wf.getframerate(), wf.getnframes())
+    except Exception:
+        pass
+    try:
+        if wav_bytes[:4] == b"RIFF" and wav_bytes[8:12] == b"WAVE":
+            sr = int.from_bytes(wav_bytes[24:28], "little")
+            data_idx = wav_bytes.find(b"data")
+            if data_idx != -1:
+                data_size = int.from_bytes(wav_bytes[data_idx + 4 : data_idx + 8], "little")
+                channels = int.from_bytes(wav_bytes[22:24], "little") or 1
+                bits = int.from_bytes(wav_bytes[34:36], "little") or 16
+                bpf = channels * (bits // 8)
+                frames = data_size // bpf if bpf > 0 else 0
+                return (sr, frames)
+    except Exception:
+        pass
+    return (22050, 0)
 
 
 def get_cached_tts_wav(cache_key: str) -> Optional[bytes]:
@@ -210,26 +235,30 @@ def _detect_phoneme_lang(text: str, voice_id: str, requested_lang: Optional[str]
     return "es"
 
 
-def _resolve_kokoro_voice(kokoro_instance, voice_id: str, lang: str):
+def _resolve_kokoro_voice(kokoro_instance, voice_id: str, lang: str, rvc_active: bool = False):
     """
     Resuelve la voz para Kokoro ONNX:
+    - Si rvc_active == True: retorna directamente 'ef_dora' pura si está disponible (cero distorsión para RVC).
     - Si voice_id == 'ef_dora': retorna directamente 'ef_dora' si está en available (voz española pura).
     - Si lang == 'es' y voice_id en ('ef_blend', 'jf_alpha') o jf_*:
       mezcla linealmente el estilo neuronal español de 'ef_dora' con el timbre anime de 'jf_alpha' (o voice_id).
     - Mantiene compatibilidad con mocks de test unitarios.
     """
     if not hasattr(kokoro_instance, "get_voice_style") or not hasattr(kokoro_instance, "get_voices"):
-        return voice_id
+        return "ef_dora" if rvc_active else voice_id
 
     try:
         available = kokoro_instance.get_voices()
     except Exception:
-        return voice_id
+        return "ef_dora" if rvc_active else voice_id
 
     if not isinstance(available, (list, tuple, set)):
-        return voice_id
+        return "ef_dora" if rvc_active else voice_id
 
-    # Si se solicita ef_dora, devolverla directamente pura sin mezcla lineal innecesaria
+    # Si RVC está activo o se solicita ef_dora, devolverla directamente pura sin mezcla lineal
+    if rvc_active and "ef_dora" in available:
+        return "ef_dora"
+
     if voice_id == "ef_dora" and "ef_dora" in available:
         return "ef_dora"
 
@@ -549,6 +578,7 @@ def _read_wav_samples(wav_bytes: bytes) -> tuple:
 def _write_wav_bytes(samples: np.ndarray, sample_rate: int = 24000) -> bytes:
     """Convierte un array de samples numpy (float32 o int16) en un WAV PCM de 16 bits con soft-limiting de picos."""
     if samples.dtype in (np.float32, np.float64):
+        samples = np.nan_to_num(samples, nan=0.0, posinf=0.98, neginf=-0.98)
         if len(samples) > 0:
             peak = float(np.max(np.abs(samples)))
             if peak > 0.98:
@@ -610,6 +640,11 @@ def _synthesize_wav_sync(
         }
         return dummy, metrics
 
+    rvc_active = bool(
+        rvc_voice and rvc_voice.strip().lower() not in ("none", "off", "desactivado", "disabled", "false", "")
+    )
+    clean_rvc_voice = rvc_voice.strip() if rvc_active else None
+
     user_speed = max(0.5, min(2.0, float(speed)))
     req_model = (model or "").lower().strip()
     is_piper = (
@@ -620,11 +655,19 @@ def _synthesize_wav_sync(
         voice_id in ("piper_f", "piper_sharvard_f", "es_ES-sharvard-medium", "1", "sharvard", "sharvard-medium")
     )
 
-    target_voice = "piper_f" if is_piper else (voice_id if voice_id in KOKORO_FEMALE_VOICES else "jf_alpha")
+    if rvc_active and not is_piper:
+        # Base voice for RVC: clean single Spanish female voice ef_dora (no blend)
+        target_voice = "ef_dora" if (not voice_id or voice_id in ("anime_es", "ef_blend", "jf_alpha", "")) else voice_id
+    else:
+        target_voice = "piper_f" if is_piper else (voice_id if voice_id in KOKORO_FEMALE_VOICES else "jf_alpha")
+
     detected_lang = "es" if is_piper else _detect_phoneme_lang(clean_text, target_voice, requested_lang=language)
     engine_used = "fallback"
 
-    if pitch_semitones is not None:
+    # Fix 1: Force effective_pitch = 0.0 for base TTS when RVC is active
+    if rvc_active:
+        effective_pitch = 0.0
+    elif pitch_semitones is not None:
         if is_piper and voice_id not in ("piper_f", "piper_sharvard_f", "es_ES-sharvard-medium", "1", "sharvard", "sharvard-medium") and abs(float(pitch_semitones) - 2.0) < 1e-4:
             effective_pitch = 0.0
         else:
@@ -640,9 +683,10 @@ def _synthesize_wav_sync(
     dsp_ms = 0.0
 
     preferred_eng = "piper" if is_piper else "kokoro"
-    cache_voice_id = f"{target_voice}+{rvc_voice}" if rvc_voice and rvc_voice.lower() not in ("none", "off") else target_voice
+    expected_engine = f"{preferred_eng}+rvc" if rvc_active else preferred_eng
+    cache_voice_id = f"{target_voice}+{clean_rvc_voice}" if rvc_active else target_voice
     cache_key = _compute_tts_cache_key(
-        clean_text, cache_voice_id, detected_lang, user_speed, effective_pitch, preferred_eng
+        clean_text, cache_voice_id, detected_lang, user_speed, effective_pitch, expected_engine
     )
     is_mock_engine = (
         os.environ.get("SENSORY_DISABLE_TTS_CACHE") == "1"
@@ -656,11 +700,11 @@ def _synthesize_wav_sync(
         cached_wav = get_cached_tts_wav(cache_key)
         if cached_wav is not None:
             infer_ms = (time.perf_counter() - t_infer_start) * 1000.0
-            sr = 24000 if preferred_eng == "kokoro" else 22050
-            audio_dur_ms = ((len(cached_wav) - 44) / (sr * 2)) * 1000.0 if len(cached_wav) > 44 else 0.0
+            sr, num_frames = _get_wav_info(cached_wav)
+            audio_dur_ms = ((num_frames) / sr) * 1000.0 if sr > 0 else 0.0
             metrics = {
                 "voice": target_voice,
-                "engine": preferred_eng,
+                "engine": expected_engine,
                 "lang": detected_lang,
                 "chars": chars,
                 "lock_wait_ms": 0.0,
@@ -670,6 +714,7 @@ def _synthesize_wav_sync(
                 "audio_dur_ms": audio_dur_ms,
                 "bytes": len(cached_wav),
                 "cache_hit": True,
+                "sample_rate": sr,
             }
             return cached_wav, metrics
 
@@ -739,7 +784,9 @@ def _synthesize_wav_sync(
                 if kokoro is not None:
                     try:
                         t_onnx_start = time.perf_counter()
-                        resolved_voice = _resolve_kokoro_voice(kokoro, "jf_alpha", "es")
+                        resolved_voice = _resolve_kokoro_voice(
+                            kokoro, "ef_dora" if rvc_active else "jf_alpha", "es", rvc_active=rvc_active
+                        )
                         samples, sample_rate = kokoro.create(
                             clean_text,
                             voice=resolved_voice,
@@ -767,7 +814,9 @@ def _synthesize_wav_sync(
             if kokoro is not None:
                 try:
                     t_onnx_start = time.perf_counter()
-                    resolved_voice = _resolve_kokoro_voice(kokoro, target_voice, detected_lang)
+                    resolved_voice = _resolve_kokoro_voice(
+                        kokoro, target_voice, detected_lang, rvc_active=rvc_active
+                    )
                     samples, sample_rate = kokoro.create(
                         clean_text,
                         voice=resolved_voice,
@@ -842,17 +891,20 @@ def _synthesize_wav_sync(
 
     # 3. Post-procesamiento opcional RVC Anime si fue solicitado
     rvc_meta = {}
-    if wav_bytes is not None and rvc_voice and rvc_voice.lower() not in ("none", "off", "desactivado", "false"):
+    rvc_applied = False
+    if wav_bytes is not None and rvc_active:
         try:
             from rvc_engine import apply_rvc_conversion
             t_rvc_start = time.perf_counter()
+            rvc_pitch = float(pitch_semitones) if pitch_semitones is not None else 0.0
             wav_bytes, rvc_meta = apply_rvc_conversion(
                 wav_bytes=wav_bytes,
-                rvc_voice=rvc_voice,
-                pitch_semitones=effective_pitch,
+                rvc_voice=clean_rvc_voice,
+                pitch_semitones=rvc_pitch,
             )
             dsp_ms += (time.perf_counter() - t_rvc_start) * 1000.0
-            if rvc_meta.get("rvc_applied"):
+            rvc_applied = bool(rvc_meta.get("rvc_applied"))
+            if rvc_applied:
                 engine_used = f"{engine_used}+rvc"
         except Exception as exc:
             logger.error(f"[TTS] Error ejecutando pipeline RVC: {exc}")
@@ -861,18 +913,20 @@ def _synthesize_wav_sync(
     if wav_bytes is None:
         wav_bytes = _generate_wav_bytes(b"\x00" * 4410, sample_rate=22050)
         engine_used = "fallback"
-    elif not is_mock_engine and ("kokoro" in engine_used or "piper" in engine_used):
-        final_key = _compute_tts_cache_key(
-            clean_text, cache_voice_id, detected_lang, user_speed, effective_pitch, engine_used
-        )
-        store_cached_tts_wav(final_key, wav_bytes)
+    else:
+        # Fix 2: Only store in cache when (not rvc_active) or rvc_applied!
+        should_cache = (not rvc_active) or rvc_applied
+        if not is_mock_engine and should_cache and ("kokoro" in engine_used or "piper" in engine_used):
+            final_key = _compute_tts_cache_key(
+                clean_text, cache_voice_id, detected_lang, user_speed, effective_pitch, engine_used
+            )
+            store_cached_tts_wav(final_key, wav_bytes)
 
     infer_ms = (time.perf_counter() - t_infer_start) * 1000.0
 
-    audio_dur_ms = 0.0
-    if len(wav_bytes) > 44:
-        sr = 24000 if engine_used == "kokoro" else 22050
-        audio_dur_ms = ((len(wav_bytes) - 44) / (sr * 2)) * 1000.0
+    # Fix 3: Accurate Sample Rate Extraction
+    sr, num_frames = _get_wav_info(wav_bytes)
+    audio_dur_ms = (num_frames / sr) * 1000.0 if sr > 0 else 0.0
 
     metrics = {
         "voice": target_voice,
@@ -1031,7 +1085,7 @@ async def tts_endpoint(req: SpeechRequest):
     )
     import base64
     audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
-    sample_rate = 24000 if metrics["engine"] == "kokoro" else 22050
+    sample_rate, _ = _get_wav_info(wav_bytes)
 
     return {
         "status": "ok",
@@ -1045,10 +1099,15 @@ async def tts_endpoint(req: SpeechRequest):
 
 
 @router.get("/v1/audio/voices")
+@router.get("/tts/voices")
 async def list_voices():
     tier = get_sensory_tier()
     default_engine = "piper" if tier == "light" else "kokoro"
     default_voice = "piper_f" if tier == "light" else "jf_alpha"
+    from rvc_engine import discover_rvc_models, get_rvc_engine_status
+    rvc_models = discover_rvc_models()
+    rvc_status = get_rvc_engine_status()
+    rvc_voice_names = list(rvc_models.keys())
     return {
         "voices": [
             {
@@ -1136,13 +1195,15 @@ async def list_voices():
         "default_voice": default_voice,
         "default_engine": default_engine,
         "tier": tier,
-        "rvc_voices": [
+        "rvc_voices": rvc_voice_names,
+        "rvc_models": [
             {
                 "name": name,
                 "has_index": bool(info.index_path),
             }
-            for name, info in __import__("rvc_engine").discover_rvc_models().items()
+            for name, info in rvc_models.items()
         ],
+        "rvc_status": rvc_status,
         "engines": {
             "kokoro": {
                 "name": "Kokoro ONNX",

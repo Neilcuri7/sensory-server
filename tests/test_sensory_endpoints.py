@@ -603,6 +603,175 @@ class TestSensoryEndpoints(unittest.TestCase):
         max_jump_smoothed = float(np.max(np.abs(np.diff(smoothed))))
         self.assertLess(max_jump_smoothed, max_jump_orig)
 
+    def test_apply_rvc_conversion_nino_and_miku_and_disabled(self):
+        """Verifica que apply_rvc_conversion procese Nino y Miku Nakano exitosamente y rechace none/inválidos."""
+        from rvc_engine import apply_rvc_conversion, get_wav_info
+
+        sr = 24000
+        t = np.linspace(0, 0.4, int(sr * 0.4), endpoint=False)
+        audio = (0.5 * np.sin(2 * np.pi * 330 * t) + 0.2 * np.sin(2 * np.pi * 660 * t)).astype(np.float32)
+        orig_wav = tts_router._write_wav_bytes(audio, sample_rate=sr)
+
+        # 1. Nino Nakano
+        out_nino, meta_nino = apply_rvc_conversion(orig_wav, "Nino Nakano")
+        self.assertTrue(meta_nino.get("rvc_applied"))
+        self.assertEqual(meta_nino.get("voice"), "Nino Nakano")
+        self.assertNotEqual(out_nino, orig_wav)
+        sr_nino, frames_nino = get_wav_info(out_nino)
+        self.assertGreater(sr_nino, 0)
+        self.assertGreater(frames_nino, 0)
+
+        # 2. Miku Nakano
+        out_miku, meta_miku = apply_rvc_conversion(orig_wav, "Miku Nakano")
+        self.assertTrue(meta_miku.get("rvc_applied"))
+        self.assertEqual(meta_miku.get("voice"), "Miku Nakano")
+        self.assertNotEqual(out_miku, orig_wav)
+        sr_miku, frames_miku = get_wav_info(out_miku)
+        self.assertGreater(sr_miku, 0)
+        self.assertGreater(frames_miku, 0)
+
+        # 3. none / off
+        out_none, meta_none = apply_rvc_conversion(orig_wav, "none")
+        self.assertFalse(meta_none.get("rvc_applied"))
+        self.assertEqual(out_none, orig_wav)
+
+        # 4. NonExistentVoice
+        out_fake, meta_fake = apply_rvc_conversion(orig_wav, "NonExistentVoice")
+        self.assertFalse(meta_fake.get("rvc_applied"))
+        self.assertEqual(out_fake, orig_wav)
+
+    def test_synthesize_sentence_wav_bytes_with_rvc_undistorted_base_and_cache(self):
+        """Verifica que la síntesis con RVC use base ef_dora, pitch 0.0, engine '+rvc', y caché consistente."""
+        from unittest.mock import patch
+
+        class DummyKokoro:
+            def get_voices(self):
+                return ["ef_dora", "jf_alpha"]
+
+            def get_voice_style(self, v):
+                return np.zeros(256, dtype=np.float32)
+
+            def create(self, text, voice="ef_dora", speed=1.0, lang="es"):
+                sr = 24000
+                samples = (0.4 * np.sin(2 * np.pi * 440 * np.linspace(0, 0.3, int(sr * 0.3)))).astype(np.float32)
+                return samples, sr
+
+        dummy_inst = DummyKokoro()
+
+        def dummy_getter():
+            return dummy_inst
+
+        text = "Prueba de síntesis de voz con RVC activo para Aoi."
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp_cache_dir:
+            with patch.object(tts_router, "TTS_CACHE_DIR", tmp_cache_dir):
+                with patch.object(tts_router, "get_kokoro_voice", dummy_getter):
+                    with patch.dict(os.environ, {"SENSORY_TIER": "full"}):
+                        # Limpiar cualquier residuo de caché RAM para la clave
+                        tts_router._tts_ram_cache.clear()
+
+                        # Llamada 1: primera síntesis (cache miss)
+                        wav1, metrics1 = tts_router._synthesize_wav_sync(
+                            text=text,
+                            voice_id="anime_es",
+                            speed=1.0,
+                            language="es",
+                            pitch_semitones=2.0,  # debe ser forzado a 0.0 por rvc_active
+                            model="kokoro",
+                            rvc_voice="Nino Nakano",
+                        )
+                        self.assertTrue(metrics1["engine"].endswith("+rvc"))
+                        self.assertFalse(metrics1.get("cache_hit", False))
+                        # Verificar que el base voice fue ef_dora
+                        self.assertEqual(metrics1["voice"], "ef_dora")
+
+                        # Llamada 2: segunda síntesis con mismos argumentos -> debe dar cache_hit
+                        wav2, metrics2 = tts_router._synthesize_wav_sync(
+                            text=text,
+                            voice_id="anime_es",
+                            speed=1.0,
+                            language="es",
+                            pitch_semitones=2.0,
+                            model="kokoro",
+                            rvc_voice="Nino Nakano",
+                        )
+                        self.assertTrue(metrics2.get("cache_hit", False), f"metrics2 cache_hit was False: {metrics2}")
+                        self.assertTrue(metrics2["engine"].endswith("+rvc"))
+                        self.assertEqual(wav1, wav2)
+
+    def test_synthesize_rvc_failure_does_not_poison_cache(self):
+        """Verifica que si la conversión RVC falla (rvc_applied=False), NO se envenene la caché."""
+        from unittest.mock import patch, MagicMock
+        import tempfile
+
+        sr = 24000
+        audio = (0.4 * np.sin(2 * np.pi * 440 * np.linspace(0, 0.3, int(sr * 0.3)))).astype(np.float32)
+        mock_kokoro = MagicMock()
+        mock_kokoro.get_voices.return_value = ["ef_dora", "jf_alpha"]
+        mock_kokoro.create.return_value = (audio, sr)
+
+        text = "Texto para prueba de fallo RVC y protección de caché."
+
+        with tempfile.TemporaryDirectory() as tmp_cache_dir:
+            with patch.object(tts_router, "TTS_CACHE_DIR", tmp_cache_dir):
+                with patch.object(tts_router, "get_kokoro_voice", return_value=mock_kokoro):
+                    # Forzar fallo simulado de apply_rvc_conversion
+                    with patch("rvc_engine.apply_rvc_conversion", return_value=(b"raw_unconverted_audio_dummy_44_bytes_padding", {"rvc_applied": False})):
+                        wav, metrics = tts_router._synthesize_wav_sync(
+                            text=text,
+                            voice_id="ef_dora",
+                            speed=1.0,
+                            language="es",
+                            pitch_semitones=0.0,
+                            model="kokoro",
+                            rvc_voice="Nino Nakano",
+                        )
+                        # Al fallar RVC, engine_used no debe terminar en +rvc
+                        self.assertFalse(metrics["engine"].endswith("+rvc"))
+
+                        # Verificar que no quedó guardado en caché para 'ef_dora+Nino Nakano'
+                        cache_key = tts_router._compute_tts_cache_key(
+                            tts_router._sanitize_text_for_tts(text),
+                            "ef_dora+Nino Nakano",
+                            "es",
+                            1.0,
+                            0.0,
+                            "kokoro+rvc"
+                        )
+                        cached = tts_router.get_cached_tts_wav(cache_key)
+                        self.assertIsNone(cached, "La caché fue envenenada con audio sin convertir cuando rvc_applied era False!")
+
+    def test_tts_endpoint_accurate_sample_rate_and_rvc(self):
+        """Verifica que /tts con rvc_voice devuelva HTTP 200, engine '+rvc', y sample_rate correspondiente al WAV."""
+        import base64
+        resp = self.client.post("/tts", json={
+            "text": "Hola, probando endpoint TTS con voz RVC Nino Nakano.",
+            "voice": "ef_dora",
+            "rvc_voice": "Nino Nakano",
+        })
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["status"], "ok")
+        self.assertIn("+rvc", data["engine"])
+        self.assertIn("audio_base64", data)
+
+        wav_bytes = base64.b64decode(data["audio_base64"])
+        sr_header, _ = tts_router._get_wav_info(wav_bytes)
+        self.assertEqual(data["sample_rate"], sr_header)
+
+    def test_voices_endpoint_exposes_rvc_voices_and_status(self):
+        """Verifica que /tts/voices y /v1/audio/voices expongan rvc_voices y rvc_status."""
+        for path in ("/tts/voices", "/v1/audio/voices"):
+            resp = self.client.get(path)
+            self.assertEqual(resp.status_code, 200)
+            data = resp.json()
+            self.assertIn("rvc_voices", data)
+            self.assertIn("Nino Nakano", data["rvc_voices"])
+            self.assertIn("Miku Nakano", data["rvc_voices"])
+            self.assertIn("rvc_status", data)
+            self.assertIn("mode", data["rvc_status"])
+
+
 
 if __name__ == "__main__":
     unittest.main()

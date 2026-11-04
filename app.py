@@ -102,10 +102,13 @@ app.include_router(ocr_router)
 async def health_check():
     import routers.stt_router as stt_mod
     import routers.tts_router as tts_mod
+    from rvc_engine import get_rvc_engine_status
 
     stt_loaded = getattr(stt_mod, "recognizer", None) is not None
     kokoro_loaded = getattr(tts_mod, "kokoro_voice", None) is not None
     piper_loaded = getattr(tts_mod, "piper_voice", None) is not None
+    rvc_status = get_rvc_engine_status()
+    rvc_ready = bool(rvc_status.get("neural_ready") or rvc_status.get("available_voices"))
 
     tier = os.environ.get("SENSORY_TIER", getattr(tts_mod, "SENSORY_TIER", "full")).lower()
 
@@ -132,11 +135,14 @@ async def health_check():
         "models": {
             "stt": stt_loaded,
             "kokoro": kokoro_loaded,
-            "piper": piper_loaded
+            "piper": piper_loaded,
+            "rvc": rvc_ready,
         },
+        "rvc": rvc_status,
         "modules": {
             "stt": "Sherpa-ONNX / Whisper-Base",
             "tts": "Kokoro ONNX / Piper ONNX (100% Local Female Voices)",
+            "rvc": f"RVC v2 ({rvc_status['mode']})",
             "vision": "RapidOCR ONNX UI Grounding",
             "ocr": "RapidOCR ONNX"
         }
