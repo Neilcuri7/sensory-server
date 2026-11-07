@@ -108,7 +108,7 @@ async def health_check():
     kokoro_loaded = getattr(tts_mod, "kokoro_voice", None) is not None
     piper_loaded = getattr(tts_mod, "piper_voice", None) is not None
     rvc_status = get_rvc_engine_status()
-    rvc_ready = bool(rvc_status.get("neural_ready") or rvc_status.get("available_voices"))
+    rvc_ready = bool(rvc_status.get("neural_ready"))
 
     tier = os.environ.get("SENSORY_TIER", getattr(tts_mod, "SENSORY_TIER", "full")).lower()
 

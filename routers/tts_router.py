@@ -54,8 +54,8 @@ def _compute_tts_cache_key(
     pitch_semitones: float,
     engine: str,
 ) -> str:
-    """Calcula clave SHA-256 determinista para caché L1/L2 de audio TTS (salt v2)."""
-    payload = f"v2:{clean_text}|{voice_id}|{lang}|{speed:.2f}|{pitch_semitones:.2f}|{engine}"
+    """Calcula clave SHA-256 determinista para caché L1/L2 de audio TTS (salt v3)."""
+    payload = f"v3:{clean_text}|{voice_id}|{lang}|{speed:.2f}|{pitch_semitones:.2f}|{engine}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -355,22 +355,6 @@ def _trim_dead_silence(
     start_idx = max(0, int(active_indices[0]) - pad_samples)
     end_idx = min(len(samples), int(active_indices[-1]) + 1 + pad_samples)
     return samples[start_idx:end_idx]
-
-
-def _apply_piper_warmth_eq(samples: np.ndarray, sample_rate: int = 22050) -> np.ndarray:
-    """
-    DSP de ecualización suave y calidez armónica para Piper (es_ES-sharvard-medium):
-    1. Filtro FIR deavivado/de-harshness suave (y[n] = 0.82 * x[n] + 0.18 * x[n-1]).
-    2. Presencia armónica suave (tanh) para eliminar asperezas metálicas VITS a 22.05kHz.
-    Preserva silencios puros (<1e-4) y longitud exacta.
-    """
-    if len(samples) < 32 or float(np.max(np.abs(samples))) < 1e-4:
-        return samples
-
-    kernel = np.array([0.82, 0.18], dtype=np.float32)
-    smoothed = np.convolve(samples, kernel, mode="same")
-    warmth = np.tanh(smoothed * 1.12) / np.tanh(1.12)
-    return warmth.astype(samples.dtype)
 
 
 def _get_elastic_session_options(disable_graph_opt: bool = False) -> ort.SessionOptions:
@@ -685,20 +669,22 @@ def _synthesize_wav_sync(
     detected_lang = "es" if is_piper else _detect_phoneme_lang(clean_text, target_voice, requested_lang=language)
     engine_used = "fallback"
 
-    # Fix 1: Force effective_pitch = 0.0 for base TTS when RVC is active
+    # Force pitch = 0.0 when RVC is active to preserve natural intonation
     if rvc_active:
         effective_pitch = 0.0
+        rvc_pitch = 0.0
     elif pitch_semitones is not None:
         if is_piper and voice_id not in ("piper_f", "piper_sharvard_f", "es_ES-sharvard-medium", "1", "sharvard", "sharvard-medium") and abs(float(pitch_semitones) - 2.0) < 1e-4:
             effective_pitch = 0.0
         else:
             effective_pitch = float(pitch_semitones)
+        rvc_pitch = effective_pitch
     elif is_piper or target_voice in ("ef_dora", "piper_f"):
         effective_pitch = 0.0
+        rvc_pitch = 0.0
     else:
         effective_pitch = 2.0
-
-    rvc_pitch = float(pitch_semitones) if pitch_semitones is not None else 0.0
+        rvc_pitch = 0.0
 
     t_infer_start = time.perf_counter()
     wav_bytes = None
@@ -787,7 +773,6 @@ def _synthesize_wav_sync(
                             raw_samples = _apply_anime_pitch_shift(
                                 raw_samples, sample_rate, effective_pitch
                             )
-                        raw_samples = _apply_piper_warmth_eq(raw_samples, sample_rate)
                         raw_samples = _trim_dead_silence(raw_samples, sample_rate)
                         dsp_ms = (time.perf_counter() - t_dsp_start) * 1000.0
                         wav_bytes = _write_wav_bytes(raw_samples, sample_rate=sample_rate)
@@ -903,7 +888,6 @@ def _synthesize_wav_sync(
                                 raw_samples = _apply_anime_pitch_shift(
                                     raw_samples, sample_rate, effective_pitch
                                 )
-                            raw_samples = _apply_piper_warmth_eq(raw_samples, sample_rate)
                             raw_samples = _trim_dead_silence(raw_samples, sample_rate)
                             dsp_ms = (time.perf_counter() - t_dsp_start) * 1000.0
                             wav_bytes = _write_wav_bytes(raw_samples, sample_rate=sample_rate)
@@ -920,7 +904,7 @@ def _synthesize_wav_sync(
         try:
             from rvc_engine import apply_rvc_conversion
             t_rvc_start = time.perf_counter()
-            rvc_pitch = float(pitch_semitones) if pitch_semitones is not None else 0.0
+            rvc_pitch = 0.0
             wav_bytes, rvc_meta = apply_rvc_conversion(
                 wav_bytes=wav_bytes,
                 rvc_voice=clean_rvc_voice,
@@ -1023,12 +1007,14 @@ async def generate_speech(req: SpeechRequest):
     elif not voice_id:
         voice_id = "jf_alpha"
 
-    if req.pitch_semitones is not None:
+    if resolved_rvc:
+        pitch = 0.0
+    elif req.pitch_semitones is not None:
         if (tier == "light" or model_req == "piper") and req.voice not in ("piper_f", "piper_sharvard_f", "es_ES-sharvard-medium") and abs(float(req.pitch_semitones) - 2.0) < 1e-4:
             pitch = 0.0
         else:
             pitch = float(req.pitch_semitones)
-    elif voice_id in ("ef_dora", "piper_f", "piper_sharvard_f", "es_ES-sharvard-medium") or model_req == "piper" or tier == "light" or resolved_rvc:
+    elif voice_id in ("ef_dora", "piper_f", "piper_sharvard_f", "es_ES-sharvard-medium") or model_req == "piper" or tier == "light":
         pitch = 0.0
     else:
         pitch = 2.0
@@ -1082,12 +1068,14 @@ async def tts_endpoint(req: SpeechRequest):
         voice_id = "jf_alpha"
 
     speed = float(req.speed or 1.05)
-    if req.pitch_semitones is not None:
+    if resolved_rvc:
+        pitch = 0.0
+    elif req.pitch_semitones is not None:
         if (tier == "light" or model_req == "piper") and req.voice not in ("piper_f", "piper_sharvard_f", "es_ES-sharvard-medium") and abs(float(req.pitch_semitones) - 2.0) < 1e-4:
             pitch = 0.0
         else:
             pitch = float(req.pitch_semitones)
-    elif voice_id in ("ef_dora", "piper_f", "piper_sharvard_f", "es_ES-sharvard-medium") or model_req == "piper" or tier == "light" or resolved_rvc:
+    elif voice_id in ("ef_dora", "piper_f", "piper_sharvard_f", "es_ES-sharvard-medium") or model_req == "piper" or tier == "light":
         pitch = 0.0
     else:
         pitch = 2.0

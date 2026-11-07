@@ -1,11 +1,8 @@
 """RVC (Retrieval-based Voice Conversion) Engine for Sensory Server.
 
-Supports a robust two-tier architecture:
-- Tier 1: Full Neural RVC v2 Inference (PyTorch + CUDA/CPU + ONNX Runtime / TorchAudio + FAISS)
-  Optimized for NVIDIA GeForce GTX 1060 (6 GB VRAM) on WSL2 / Linux as well as CPU inference.
-- Tier 2: High-Precision Zero-Distortion DSP Anime Voice Timbre & Formant Converter Fallback
-  When PyTorch / neural weights are absent, provides deterministic, artifact-free STFT
-  spectral envelope warping tailored specifically to character profiles (Nino Nakano, Miku Nakano).
+Neural RVC v2 Inference (PyTorch + CUDA/CPU + ONNX Runtime / TorchAudio + FAISS)
+Optimized for NVIDIA GeForce GTX 1060 (6 GB VRAM) on WSL2 / Linux as well as CPU inference.
+When neural inference is not active, cleanly passes through base TTS without distortion.
 """
 from __future__ import annotations
 
@@ -216,8 +213,6 @@ def get_rvc_engine_status() -> dict[str, object]:
 
     if neural_ready:
         mode = "neural"
-    elif available_voices:
-        mode = "dsp_formant"
     else:
         mode = "disabled"
 
@@ -235,116 +230,7 @@ def get_rvc_engine_status() -> dict[str, object]:
 
 
 # ==============================================================================
-# Tier 2: Studio-Clean Phase-Coherent STFT Formant & Timbre Converter
-# ==============================================================================
-
-def _apply_dsp_anime_timbre_conversion(
-    wav_bytes: bytes,
-    voice_name: str,
-    pitch_semitones: float = 0.0,
-) -> tuple[bytes, dict[str, object]]:
-    """Transforms synthesized speech timbre and formant envelope to match character identity.
-
-    Uses cepstral liftering + spectral envelope warping with exact phase coherence
-    (scipy.signal.stft / istft). Retains 100% natural prosodia and introduces ZERO
-    metallic graininess, zero duration change, and zero robotic artifacting.
-    """
-    samples, sr = _read_wav_samples(wav_bytes)
-    if len(samples) < 512:
-        return wav_bytes, {"rvc_applied": True, "voice": voice_name, "mode": "dsp_passthrough"}
-
-    # STFT settings: 1024-point Hanning window, 75% overlap for artifact-free OLA
-    nperseg = 1024
-    noverlap = 768
-    f, t_bins, Zxx = scipy.signal.stft(
-        samples, fs=sr, window="hann", nperseg=nperseg, noverlap=noverlap
-    )
-    mag = np.abs(Zxx)
-    phase = np.angle(Zxx)
-
-    # 1. Cepstral liftering: separate vocal tract spectral envelope from excitation
-    log_mag = np.log(mag + 1e-8)
-    cepstrum = np.fft.irfft(log_mag, axis=0)
-
-    # Vocal tract formants reside in low quefrencies (quefrency bins 0..cutoff)
-    cutoff = 28
-    taper = 8
-    lifter = np.zeros_like(cepstrum)
-    lifter[:cutoff] = 1.0
-    if cutoff + taper < lifter.shape[0]:
-        taper_weights = 0.5 * (1.0 + np.cos(np.linspace(0, np.pi, taper)))
-        lifter[cutoff : cutoff + taper] = taper_weights[:, np.newaxis]
-
-    log_env = np.fft.rfft(cepstrum * lifter, axis=0).real
-    env = np.exp(log_env)
-    harmonics = mag / (env + 1e-8)
-
-    # 2. Character profile configuration
-    v_norm = voice_name.lower().strip()
-    num_bins = env.shape[0]
-    freqs = np.linspace(0, sr / 2, num_bins)
-
-    if "nino" in v_norm:
-        # Nino Nakano: Assertive tsundere bright formant shift (+6%),
-        # presence boost at 2.8 - 4.2 kHz, plus high-frequency sparkle
-        alpha = 1.06
-        # Bell filter around 3.5 kHz (+2.8 dB)
-        presence = 1.0 + 0.38 * np.exp(-((freqs - 3500.0) ** 2) / (2.0 * (700.0 ** 2)))
-        # High shelf boost > 5.5 kHz (+1.5 dB)
-        high_shelf = 1.0 + 0.18 / (1.0 + np.exp(-(freqs - 5500.0) / 1000.0))
-        filter_curve = presence * high_shelf
-    elif "miku" in v_norm:
-        # Miku Nakano: Soft, breathy-sweet dandere timbre (+8.5% formant shift),
-        # warm 2.2 - 3.5 kHz resonance, airy high shelf, and softened low-mids
-        alpha = 1.085
-        # Warm sweet resonance around 2.85 kHz (+2.4 dB)
-        warmth = 1.0 + 0.31 * np.exp(-((freqs - 2850.0) ** 2) / (2.0 * (650.0 ** 2)))
-        # Airy high-shelf > 6.0 kHz (+2.5 dB)
-        air = 1.0 + 0.33 / (1.0 + np.exp(-(freqs - 6200.0) / 1200.0))
-        # Subtle softening around 500 Hz (-1.0 dB) for gentler vocal body
-        low_mid_dip = 1.0 - 0.11 * np.exp(-((freqs - 500.0) ** 2) / (2.0 * (200.0 ** 2)))
-        filter_curve = warmth * air * low_mid_dip
-    else:
-        # Generic anime voice profile: +7% formant shift, 3.2 kHz presence boost
-        alpha = 1.07
-        filter_curve = 1.0 + 0.25 * np.exp(-((freqs - 3200.0) ** 2) / (2.0 * (600.0 ** 2)))
-
-    # 3. Formant warp: stretch envelope along frequency axis
-    freq_indices = np.arange(num_bins)
-    warped_indices = freq_indices / alpha
-    warped_env = np.empty_like(env)
-    for col in range(env.shape[1]):
-        warped_env[:, col] = np.interp(
-            warped_indices, freq_indices, env[:, col], left=env[0, col], right=env[-1, col]
-        )
-
-    # 4. Recombine excitation, warped envelope, and character frequency filter
-    new_mag = harmonics * warped_env * filter_curve[:, np.newaxis]
-
-    # 5. Inverse STFT with original phase to guarantee zero phase distortion
-    new_Zxx = new_mag * np.exp(1j * phase)
-    _, out_samples = scipy.signal.istft(
-        new_Zxx, fs=sr, window="hann", nperseg=nperseg, noverlap=noverlap
-    )
-
-    # Align length with input
-    if len(out_samples) > len(samples):
-        out_samples = out_samples[: len(samples)]
-    elif len(out_samples) < len(samples):
-        out_samples = np.pad(out_samples, (0, len(samples) - len(out_samples)))
-
-    converted_wav = _write_wav_bytes(out_samples, sample_rate=sr)
-    return converted_wav, {
-        "rvc_applied": True,
-        "voice": voice_name,
-        "mode": "dsp_formant",
-        "formant_shift_pct": round((alpha - 1.0) * 100, 1),
-        "sr": sr,
-    }
-
-
-# ==============================================================================
-# Tier 1: Full Neural RVC v2 Inference (PyTorch + CUDA / CPU)
+# Neural RVC v2 Inference (PyTorch + CUDA / CPU)
 # ==============================================================================
 
 def _extract_f0_autocorr(
@@ -636,10 +522,9 @@ def apply_rvc_conversion(
 ) -> tuple[bytes, dict[str, object]]:
     """Converts a WAV byte payload into the requested RVC voice.
 
-    Uses Tier 1 Neural inference if PyTorch & neural feature extractors are present.
-    Seamlessly falls back to Tier 2 DSP Anime Formant Transformation when running
-    in lightweight environments without PyTorch, guaranteeing clean, zero-distortion
-    conversion whenever a valid RVC model exists on disk.
+    Uses Neural RVC v2 inference (PyTorch + CUDA/CPU + ONNX Runtime / TorchAudio + FAISS).
+    If neural models or PyTorch are not available or inference fails, cleanly passes through
+    the base audio without distortion.
     """
     if not rvc_voice or rvc_voice.strip().lower() in ("none", "off", "desactivado", "disabled", "false", ""):
         return wav_bytes, {"rvc_applied": False, "reason": "rvc_disabled"}
@@ -669,7 +554,7 @@ def apply_rvc_conversion(
 
     status = get_rvc_engine_status()
 
-    # Try Tier 1: Neural RVC inference
+    # Neural RVC inference
     if status["neural_ready"]:
         with _RVC_LOCK:
             try:
@@ -680,23 +565,19 @@ def apply_rvc_conversion(
                     index_rate=index_rate,
                 )
             except Exception as exc:
-                logger.warning(
-                    f"[RVC] Neural inference error for '{matched_model.name}': {exc}. "
-                    f"Falling back to Tier 2 DSP formant converter."
-                )
+                logger.error(f"[RVC] Neural inference error for '{matched_model.name}': {exc}")
+                return wav_bytes, {
+                    "rvc_applied": False,
+                    "error": str(exc),
+                    "voice": matched_model.name,
+                }
 
-    # Tier 2: Studio-Clean DSP Formant & Timbre Transformation Fallback
-    with _RVC_LOCK:
-        try:
-            return _apply_dsp_anime_timbre_conversion(
-                wav_bytes=wav_bytes,
-                voice_name=matched_model.name,
-                pitch_semitones=pitch_semitones,
-            )
-        except Exception as exc:
-            logger.error(f"[RVC] DSP conversion error for '{matched_model.name}': {exc}")
-            return wav_bytes, {
-                "rvc_applied": False,
-                "error": str(exc),
-                "voice": matched_model.name,
-            }
+    logger.warning(
+        f"[RVC] Neural RVC inference not ready (missing torch or feature extractors). "
+        f"Returning clean base audio."
+    )
+    return wav_bytes, {
+        "rvc_applied": False,
+        "reason": "neural_not_ready",
+        "voice": matched_model.name,
+    }
