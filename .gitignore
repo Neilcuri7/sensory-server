@@ -27,5 +27,6 @@ models/tts_cache/*
 models/vision/*
 models/rvc/*/*.pth
 models/rvc/*/*.index
+models/rvc/*.onnx
 !models/rvc/.gitkeep
 !models/.gitkeep

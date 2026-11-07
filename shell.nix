@@ -37,15 +37,17 @@ pkgs.mkShell {
       pkgs.libxext
       pkgs.libxrender
       pkgs.espeak-ng
-    ]}:$LD_LIBRARY_PATH"
+    ]}:/usr/lib/wsl/lib:$LD_LIBRARY_PATH"
 
     export ESPEAK_DATA_PATH="${pkgs.espeak-ng}/share/espeak-ng-data"
 
     if [ ! -d ".venv" ]; then
       python -m venv .venv
+      source .venv/bin/activate
+      pip install --quiet -r requirements.txt
+    else
+      source .venv/bin/activate
     fi
-    source .venv/bin/activate
-    pip install --quiet -r requirements.txt
     echo "Sensory Server listo en puerto 8888."
   '';
 }

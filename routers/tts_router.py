@@ -373,7 +373,7 @@ def _apply_piper_warmth_eq(samples: np.ndarray, sample_rate: int = 22050) -> np.
     return warmth.astype(samples.dtype)
 
 
-def _get_elastic_session_options() -> ort.SessionOptions:
+def _get_elastic_session_options(disable_graph_opt: bool = False) -> ort.SessionOptions:
     """Configura SessionOptions elásticas con optimización de grafo total y memoria para CPU/GPU."""
     sess_options = ort.SessionOptions()
     default_threads = min(4, os.cpu_count() or 4)
@@ -383,14 +383,17 @@ def _get_elastic_session_options() -> ort.SessionOptions:
         cpu_threads = default_threads
     sess_options.intra_op_num_threads = cpu_threads
     sess_options.inter_op_num_threads = 1
-    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    if disable_graph_opt:
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    else:
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     sess_options.enable_cpu_mem_arena = True
     # Silenciar advertencias internas de ONNX Runtime para degradación limpia a CPU
     sess_options.log_severity_level = 3
     return sess_options
 
 
-def _create_elastic_inference_session(model_path: str) -> tuple[ort.InferenceSession, str]:
+def _create_elastic_inference_session(model_path: str, disable_graph_opt: bool = False) -> tuple[ort.InferenceSession, str]:
     """
     Crea una sesión ONNX Runtime elástica:
     1. Detecta si CUDAExecutionProvider o DmlExecutionProvider (DirectML en Windows)
@@ -400,7 +403,7 @@ def _create_elastic_inference_session(model_path: str) -> tuple[ort.InferenceSes
     4. En CPU configura SessionOptions con intra_op_num_threads = min(4, os.cpu_count() or 4).
     """
     available = ort.get_available_providers()
-    sess_options = _get_elastic_session_options()
+    sess_options = _get_elastic_session_options(disable_graph_opt=disable_graph_opt)
     cpu_threads = sess_options.intra_op_num_threads
     model_name = os.path.basename(model_path)
 
@@ -458,7 +461,7 @@ def get_piper_voice():
         try:
             from piper import PiperVoice
             if os.path.exists(PIPER_ES_MODEL) and os.path.exists(PIPER_ES_CONFIG):
-                session, provider = _create_elastic_inference_session(PIPER_ES_MODEL)
+                session, provider = _create_elastic_inference_session(PIPER_ES_MODEL, disable_graph_opt=True)
                 piper_voice = PiperVoice.load(PIPER_ES_MODEL, config_path=PIPER_ES_CONFIG)
                 piper_voice.session = session
                 logger.info(f"Motor Piper TTS inicializado con éxito [provider={provider}].")
@@ -610,6 +613,26 @@ def _generate_wav_bytes(audio_data: bytes, sample_rate: int = 22050) -> bytes:
     return out.getvalue()
 
 
+def _resolve_rvc_voice_name(voice_id: Optional[str], rvc_voice: Optional[str]) -> Optional[str]:
+    """Resuelve el nombre de modelo RVC si fue pasado en rvc_voice o directamente en voice."""
+    from rvc_engine import discover_rvc_models
+    models = discover_rvc_models()
+    for candidate in (rvc_voice, voice_id):
+        if not candidate:
+            continue
+        c_clean = candidate.strip()
+        if c_clean.lower() in ("none", "off", "desactivado", "disabled", "false", ""):
+            continue
+        if c_clean in models:
+            return models[c_clean].name
+        for k, v in models.items():
+            if k.lower() == c_clean.lower():
+                return v.name
+    if rvc_voice and rvc_voice.strip().lower() not in ("none", "off", "desactivado", "disabled", "false", ""):
+        return rvc_voice.strip()
+    return None
+
+
 def _synthesize_wav_sync(
     text: str,
     voice_id: str,
@@ -640,10 +663,8 @@ def _synthesize_wav_sync(
         }
         return dummy, metrics
 
-    rvc_active = bool(
-        rvc_voice and rvc_voice.strip().lower() not in ("none", "off", "desactivado", "disabled", "false", "")
-    )
-    clean_rvc_voice = rvc_voice.strip() if rvc_active else None
+    clean_rvc_voice = _resolve_rvc_voice_name(voice_id, rvc_voice)
+    rvc_active = bool(clean_rvc_voice)
 
     user_speed = max(0.5, min(2.0, float(speed)))
     req_model = (model or "").lower().strip()
@@ -657,7 +678,7 @@ def _synthesize_wav_sync(
 
     if rvc_active and not is_piper:
         # Base voice for RVC: clean single Spanish female voice ef_dora (no blend)
-        target_voice = "ef_dora" if (not voice_id or voice_id in ("anime_es", "ef_blend", "jf_alpha", "")) else voice_id
+        target_voice = "ef_dora" if (not voice_id or voice_id in ("anime_es", "ef_blend", "jf_alpha", "") or voice_id == clean_rvc_voice) else voice_id
     else:
         target_voice = "piper_f" if is_piper else (voice_id if voice_id in KOKORO_FEMALE_VOICES else "jf_alpha")
 
@@ -677,6 +698,8 @@ def _synthesize_wav_sync(
     else:
         effective_pitch = 2.0
 
+    rvc_pitch = float(pitch_semitones) if pitch_semitones is not None else 0.0
+
     t_infer_start = time.perf_counter()
     wav_bytes = None
     onnx_ms = 0.0
@@ -685,8 +708,9 @@ def _synthesize_wav_sync(
     preferred_eng = "piper" if is_piper else "kokoro"
     expected_engine = f"{preferred_eng}+rvc" if rvc_active else preferred_eng
     cache_voice_id = f"{target_voice}+{clean_rvc_voice}" if rvc_active else target_voice
+    cache_pitch = rvc_pitch if rvc_active else effective_pitch
     cache_key = _compute_tts_cache_key(
-        clean_text, cache_voice_id, detected_lang, user_speed, effective_pitch, expected_engine
+        clean_text, cache_voice_id, detected_lang, user_speed, cache_pitch, expected_engine
     )
     is_mock_engine = (
         os.environ.get("SENSORY_DISABLE_TTS_CACHE") == "1"
@@ -918,7 +942,7 @@ def _synthesize_wav_sync(
         should_cache = (not rvc_active) or rvc_applied
         if not is_mock_engine and should_cache and ("kokoro" in engine_used or "piper" in engine_used):
             final_key = _compute_tts_cache_key(
-                clean_text, cache_voice_id, detected_lang, user_speed, effective_pitch, engine_used
+                clean_text, cache_voice_id, detected_lang, user_speed, cache_pitch, engine_used
             )
             store_cached_tts_wav(final_key, wav_bytes)
 
@@ -987,13 +1011,14 @@ async def generate_speech(req: SpeechRequest):
     tier = get_sensory_tier()
     model_req = (req.model or "").lower().strip()
     voice_id = (req.voice or "").strip()
+    resolved_rvc = _resolve_rvc_voice_name(voice_id, req.rvc_voice)
 
     if tier == "light":
         model_req = "piper"
         if not voice_id or voice_id not in ("piper_f", "piper_sharvard_f", "es_ES-sharvard-medium"):
             voice_id = "piper_f"
     elif model_req in ("piper", "piper-tts", "piper_f", "sharvard"):
-        if not voice_id or voice_id in ("jf_alpha", "default"):
+        if not voice_id or voice_id in ("jf_alpha", "default") or voice_id == resolved_rvc:
             voice_id = "piper_f"
     elif not voice_id:
         voice_id = "jf_alpha"
@@ -1003,7 +1028,7 @@ async def generate_speech(req: SpeechRequest):
             pitch = 0.0
         else:
             pitch = float(req.pitch_semitones)
-    elif voice_id in ("ef_dora", "piper_f", "piper_sharvard_f", "es_ES-sharvard-medium") or model_req == "piper" or tier == "light":
+    elif voice_id in ("ef_dora", "piper_f", "piper_sharvard_f", "es_ES-sharvard-medium") or model_req == "piper" or tier == "light" or resolved_rvc:
         pitch = 0.0
     else:
         pitch = 2.0
@@ -1016,7 +1041,7 @@ async def generate_speech(req: SpeechRequest):
         req.language or "es",
         pitch,
         model=model_req,
-        rvc_voice=req.rvc_voice,
+        rvc_voice=resolved_rvc or req.rvc_voice,
     )
     logger.info(
         f"[TTS Synthesis] voice='{metrics['voice']}' ({metrics['engine']}), lang='{metrics['lang']}', "
@@ -1044,13 +1069,14 @@ async def tts_endpoint(req: SpeechRequest):
     tier = get_sensory_tier()
     model_req = (req.model or "").lower().strip()
     voice_id = (req.voice or "").strip()
+    resolved_rvc = _resolve_rvc_voice_name(voice_id, req.rvc_voice)
 
     if tier == "light":
         model_req = "piper"
         if not voice_id or voice_id not in ("piper_f", "piper_sharvard_f", "es_ES-sharvard-medium"):
             voice_id = "piper_f"
     elif model_req in ("piper", "piper-tts", "piper_f", "sharvard"):
-        if not voice_id or voice_id in ("jf_alpha", "default"):
+        if not voice_id or voice_id in ("jf_alpha", "default") or voice_id == resolved_rvc:
             voice_id = "piper_f"
     elif not voice_id:
         voice_id = "jf_alpha"
@@ -1061,7 +1087,7 @@ async def tts_endpoint(req: SpeechRequest):
             pitch = 0.0
         else:
             pitch = float(req.pitch_semitones)
-    elif voice_id in ("ef_dora", "piper_f", "piper_sharvard_f", "es_ES-sharvard-medium") or model_req == "piper" or tier == "light":
+    elif voice_id in ("ef_dora", "piper_f", "piper_sharvard_f", "es_ES-sharvard-medium") or model_req == "piper" or tier == "light" or resolved_rvc:
         pitch = 0.0
     else:
         pitch = 2.0
@@ -1075,7 +1101,7 @@ async def tts_endpoint(req: SpeechRequest):
         lang,
         pitch,
         model=model_req,
-        rvc_voice=req.rvc_voice,
+        rvc_voice=resolved_rvc or req.rvc_voice,
     )
     logger.info(
         f"[TTS Synthesis] voice='{metrics['voice']}' ({metrics['engine']}), lang='{metrics['lang']}', "

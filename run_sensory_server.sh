@@ -3,6 +3,7 @@
 # Sensory Server (Puerto 8888)
 # Unifica STT, TTS, Visión y OCR en 1 solo proceso
 # Soporta niveles de ejecución: --tier [light|full]
+# Opcional: --with-rvc
 # ==============================================================================
 set -e
 
@@ -10,6 +11,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$DIR"
 
 TIER="${SENSORY_TIER:-full}"
+WITH_RVC=false
 REMAINING_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -22,6 +24,10 @@ while [[ $# -gt 0 ]]; do
       TIER="${1#*=}"
       shift 1
       ;;
+    --with-rvc)
+      WITH_RVC=true
+      shift 1
+      ;;
     *)
       REMAINING_ARGS+=("$1")
       shift 1
@@ -30,6 +36,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 export SENSORY_TIER="$(echo "$TIER" | tr '[:upper:]' '[:lower:]')"
+if [ "$WITH_RVC" = true ]; then
+  export SENSORY_WITH_RVC=1
+fi
 
 if [ -d ".venv" ]; then
     source .venv/bin/activate
@@ -39,5 +48,5 @@ export SENSORY_PORT=${SENSORY_PORT:-${AOI_SENSORY_PORT:-8888}}
 export SENSORY_HOST=${SENSORY_HOST:-${AOI_SENSORY_HOST:-0.0.0.0}}
 export SENSORY_CPU_THREADS=${SENSORY_CPU_THREADS:-4}
 
-echo "Iniciando Sensory Server en $SENSORY_HOST:$SENSORY_PORT (Tier: $SENSORY_TIER, CPU Threads: $SENSORY_CPU_THREADS)..."
+echo "Iniciando Sensory Server en $SENSORY_HOST:$SENSORY_PORT (Tier: $SENSORY_TIER, RVC: ${SENSORY_WITH_RVC:-0}, CPU Threads: $SENSORY_CPU_THREADS)..."
 exec python app.py "${REMAINING_ARGS[@]}"

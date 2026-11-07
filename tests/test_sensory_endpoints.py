@@ -771,6 +771,46 @@ class TestSensoryEndpoints(unittest.TestCase):
             self.assertIn("rvc_status", data)
             self.assertIn("mode", data["rvc_status"])
 
+    def test_piper_e2e_with_all_rvc_voices_and_endpoints(self):
+        """Test E2E que verifica la síntesis real con Piper + RVC para Nino Nakano y Miku Nakano en /tts y /v1/audio/speech."""
+        import base64
+        from rvc_engine import discover_rvc_models, get_wav_info
+
+        rvc_models = discover_rvc_models()
+        self.assertIn("Nino Nakano", rvc_models)
+        self.assertIn("Miku Nakano", rvc_models)
+
+        with patch.dict(os.environ, {"SENSORY_TIER": "light"}):
+            for rvc_name in ("Nino Nakano", "Miku Nakano"):
+                # 1. Endpoint /tts con rvc_voice explícito en tier light (Piper)
+                resp_tts = self.client.post("/tts", json={
+                    "text": f"Hola, esta es una prueba de Piper con la voz de {rvc_name}.",
+                    "model": "piper",
+                    "voice": "piper_f",
+                    "rvc_voice": rvc_name,
+                })
+                self.assertEqual(resp_tts.status_code, 200)
+                data_tts = resp_tts.json()
+                self.assertEqual(data_tts["status"], "ok")
+                self.assertEqual(data_tts["engine"], "piper+rvc")
+                self.assertEqual(data_tts["voice"], "piper_f")
+                wav_bytes = base64.b64decode(data_tts["audio_base64"])
+                sr, frames = get_wav_info(wav_bytes)
+                self.assertEqual(data_tts["sample_rate"], sr)
+                self.assertGreater(frames, 1000)
+
+                # 2. Endpoint /v1/audio/speech pasando el nombre del modelo RVC directamente en 'voice'
+                resp_speech = self.client.post("/v1/audio/speech", json={
+                    "input": f"Probando voz directa {rvc_name} sobre motor Piper.",
+                    "model": "piper",
+                    "voice": rvc_name,
+                })
+                self.assertEqual(resp_speech.status_code, 200)
+                self.assertEqual(resp_speech.headers.get("X-TTS-Engine"), "piper+rvc")
+                self.assertEqual(resp_speech.headers.get("X-TTS-Voice"), "piper_f")
+                sr_sp, frames_sp = get_wav_info(resp_speech.content)
+                self.assertGreater(sr_sp, 0)
+                self.assertGreater(frames_sp, 1000)
 
 
 if __name__ == "__main__":

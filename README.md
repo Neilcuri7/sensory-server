@@ -48,7 +48,10 @@ Sensory Hub permite seleccionar el nivel de modelos y consumo de recursos según
 
 #### Opción A: Con el Script de Arranque (Recomendado)
 ```bash
-# Ejecución en tier ligero:
+# Ejecución en tier ligero con soporte RVC Anime:
+./run_sensory_server.sh --tier light --with-rvc
+
+# O ejecución básica en tier ligero:
 ./run_sensory_server.sh --tier light
 
 # Ejecución en tier completo:
@@ -57,7 +60,7 @@ Sensory Hub permite seleccionar el nivel de modelos y consumo de recursos según
 
 #### Opción B: Con Nix (NixOS / Linux)
 ```bash
-nix-shell --run "./run_sensory_server.sh --tier full"
+nix-shell --run "./run_sensory_server.sh --tier light --with-rvc"
 ```
 
 #### Opción C: Con Entorno Virtual Python

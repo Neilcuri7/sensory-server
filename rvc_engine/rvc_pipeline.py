@@ -380,18 +380,33 @@ def _extract_f0_autocorr(
     return f0
 
 
+def _get_ort_providers() -> list[str]:
+    """Returns viable ONNX Runtime execution providers without missing-library spam."""
+    import ctypes
+    import onnxruntime as ort
+
+    if "CUDAExecutionProvider" in ort.get_available_providers():
+        try:
+            ctypes.CDLL("libcublasLt.so.11")
+            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        except OSError:
+            pass
+    return ["CPUExecutionProvider"]
+
+
 def _extract_features_onnx(
     onnx_path: str,
     audio_16k: np.ndarray,
+    is_v2: bool = True,
 ) -> np.ndarray:
-    """Extracts 768-dim features from ContentVec ONNX."""
+    """Extracts 768-dim (v2) or 256-dim (v1) features from ContentVec ONNX."""
     import onnxruntime as ort
 
     sess_key = f"ort_session_{onnx_path}"
     if sess_key not in _LOADED_MODELS:
         so = ort.SessionOptions()
         so.log_severity_level = 3
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if "CUDAExecutionProvider" in ort.get_available_providers() else ["CPUExecutionProvider"]
+        providers = _get_ort_providers()
         _LOADED_MODELS[sess_key] = ort.InferenceSession(onnx_path, sess_options=so, providers=providers)
     session = _LOADED_MODELS[sess_key]
 
@@ -404,9 +419,23 @@ def _extract_features_onnx(
     else:
         inp_data = audio_16k.reshape(1, -1).astype(np.float32)
 
-    outputs = session.run(None, {inp_name: inp_data})
-    feat = outputs[0]
-    if feat.ndim == 3 and feat.shape[-1] != 768 and feat.shape[1] == 768:
+    target_dim = 768 if is_v2 else 256
+    output_names = [o.name for o in session.get_outputs()]
+    if is_v2 and "unit12" in output_names:
+        outputs = session.run(["unit12"], {inp_name: inp_data})
+        feat = outputs[0]
+    elif not is_v2 and "units9" in output_names:
+        outputs = session.run(["units9"], {inp_name: inp_data})
+        feat = outputs[0]
+    else:
+        outputs = session.run(None, {inp_name: inp_data})
+        feat = outputs[0]
+        for cand in outputs:
+            if cand.ndim == 3 and (cand.shape[-1] == target_dim or cand.shape[1] == target_dim):
+                feat = cand
+                break
+
+    if feat.ndim == 3 and feat.shape[-1] != target_dim and feat.shape[1] == target_dim:
         feat = np.transpose(feat, (0, 2, 1))
     return feat
 
@@ -469,7 +498,7 @@ def _run_neural_rvc_inference(
     # 2. Extract 768-dim features (ContentVec ONNX or torchaudio HuBERT Base)
     contentvec_path = _find_contentvec_onnx()
     if contentvec_path:
-        feat_np = _extract_features_onnx(contentvec_path, audio_16k)
+        feat_np = _extract_features_onnx(contentvec_path, audio_16k, is_v2=is_v2)
         feats = torch.from_numpy(feat_np).to(device)
     else:
         import torchaudio
@@ -496,19 +525,25 @@ def _run_neural_rvc_inference(
             import faiss
             idx_key = f"faiss_idx_{model_files.index_path}"
             if idx_key not in _LOADED_MODELS:
-                _LOADED_MODELS[idx_key] = faiss.read_index(model_files.index_path)
-            index = _LOADED_MODELS[idx_key]
+                index = faiss.read_index(model_files.index_path)
+                if hasattr(index, "make_direct_map"):
+                    try:
+                        index.make_direct_map()
+                    except Exception:
+                        pass
+                big_npy = index.reconstruct_n(0, index.ntotal)
+                _LOADED_MODELS[idx_key] = (index, big_npy)
+            index, big_npy = _LOADED_MODELS[idx_key]
 
             feats_np = feats[0].cpu().numpy().astype(np.float32)
-            _, ix = index.search(feats_np, 1)
-            if hasattr(index, "reconstruct"):
-                retrieved = np.array(
-                    [index.reconstruct(int(i)) for i in ix.squeeze(-1)], dtype=np.float32
-                )
-                feats = (
-                    torch.from_numpy(retrieved).unsqueeze(0).to(device) * index_rate
-                    + (1.0 - index_rate) * feats
-                )
+            score, ix = index.search(feats_np, k=8)
+            weight = np.square(1.0 / (score + 1e-6))
+            weight /= weight.sum(axis=1, keepdims=True)
+            retrieved = np.sum(big_npy[ix] * np.expand_dims(weight, axis=2), axis=1).astype(np.float32)
+            feats = (
+                torch.from_numpy(retrieved).unsqueeze(0).to(device=device, dtype=feats.dtype) * index_rate
+                + (1.0 - index_rate) * feats
+            )
         except Exception as e:
             logger.debug(f"[RVC] FAISS retrieval bypassed: {e}")
 
@@ -521,7 +556,7 @@ def _run_neural_rvc_inference(
             if sess_key not in _LOADED_MODELS:
                 so = ort.SessionOptions()
                 so.log_severity_level = 3
-                providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if "CUDAExecutionProvider" in ort.get_available_providers() else ["CPUExecutionProvider"]
+                providers = _get_ort_providers()
                 _LOADED_MODELS[sess_key] = ort.InferenceSession(rmvpe_path, sess_options=so, providers=providers)
             rmvpe_sess = _LOADED_MODELS[sess_key]
             out = rmvpe_sess.run(
