@@ -1,24 +1,28 @@
 """
 Sensory Server (Unified Perception & Audio Microservice).
-Consolida STT (Sherpa/Whisper), TTS (Kokoro/Piper 100% Local), Visión (Qwen2-VL) y OCR (RapidOCR)
+Consolida STT (Sherpa/Whisper), TTS (Piper ONNX 100% Local), Visión (Qwen2-VL) y OCR (RapidOCR)
 en un único proceso FastAPI de alta eficiencia y bajo consumo de memoria.
 Puerto por defecto: 8888
 """
+from __future__ import annotations
+
+import asyncio
+from contextlib import asynccontextmanager
+import logging
 import os
 import time
 import uuid
-import logging
-import asyncio
-from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from routers.stt_router import router as stt_router
-from routers.tts_router import router as tts_router
-from routers.vision_router import router as vision_router
+from adapters.stt.sherpa_whisper import SherpaWhisperAdapter
+from adapters.tts.piper_engine import PiperEngine
 from routers.ocr_router import router as ocr_router
+from routers.stt_router import get_stt_engine, router as stt_router, set_stt_engine
+from routers.tts_router import get_tts_engine, router as tts_router, set_tts_engine
+from routers.vision_router import router as vision_router
 
 log_level_name = os.getenv("SENSORY_LOG_LEVEL", os.getenv("AOI_SENSORY_LOG_LEVEL", "INFO")).upper()
 log_level = getattr(logging, log_level_name, logging.INFO)
@@ -56,21 +60,18 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 async def lifespan(app: FastAPI):
     logger.info("Sensory Server iniciando en puerto 8888...")
 
-    # Pre-calentar modelos ONNX en memoria para eliminar latencia en el primer turno
-    def _warmup_models():
-        from routers.stt_router import get_recognizer
-        from routers.tts_router import get_kokoro_voice, get_piper_voice
-        tier = os.environ.get("SENSORY_TIER", "full").lower()
-        try:
-            get_recognizer()
-            if tier != "light":
-                get_kokoro_voice()
-            get_piper_voice()
-            logger.info("Modelos STT y TTS pre-cargados exitosamente en RAM.")
-        except Exception as e:
-            logger.warning(f"Aviso durante pre-carga de modelos: {e}")
+    tts_engine = PiperEngine()
+    stt_engine = SherpaWhisperAdapter()
 
-    asyncio.create_task(asyncio.to_thread(_warmup_models))
+    app.state.tts_engine = tts_engine
+    app.state.stt_engine = stt_engine
+    set_tts_engine(tts_engine)
+    set_stt_engine(stt_engine)
+
+    logger.info(
+        f"Motores cargados: TTS (Piper) ready={tts_engine.is_ready()}, "
+        f"STT (Sherpa/Whisper) ready={stt_engine.is_ready()}"
+    )
     yield
     logger.info("Deteniendo Sensory Server...")
 
@@ -99,50 +100,29 @@ app.include_router(ocr_router)
 
 
 @app.get("/health")
-async def health_check():
-    import routers.stt_router as stt_mod
-    import routers.tts_router as tts_mod
-    from rvc_engine import get_rvc_engine_status
+async def health_check(request: Request):
+    stt_engine = get_stt_engine(request.app)
+    tts_engine = get_tts_engine(request.app)
 
-    stt_loaded = getattr(stt_mod, "recognizer", None) is not None
-    kokoro_loaded = getattr(tts_mod, "kokoro_voice", None) is not None
-    piper_loaded = getattr(tts_mod, "piper_voice", None) is not None
-    rvc_status = get_rvc_engine_status()
-    rvc_ready = bool(rvc_status.get("neural_ready"))
-
-    tier = os.environ.get("SENSORY_TIER", getattr(tts_mod, "SENSORY_TIER", "full")).lower()
-
-    if tier == "light":
-        if stt_loaded and piper_loaded:
-            health_status = "healthy"
-        elif stt_loaded or piper_loaded:
-            health_status = "degraded"
-        else:
-            health_status = "down"
-    else:
-        if stt_loaded and kokoro_loaded and piper_loaded:
-            health_status = "healthy"
-        elif stt_loaded or kokoro_loaded or piper_loaded:
-            health_status = "degraded"
-        else:
-            health_status = "down"
+    stt_ready = bool(stt_engine and stt_engine.is_ready())
+    tts_ready = bool(tts_engine and tts_engine.is_ready())
+    status = "ok" if (stt_ready and tts_ready) else "degraded"
 
     return {
-        "status": health_status,
+        "status": status,
         "service": "sensory-hub",
-        "tier": tier,
+        "active_engine": "piper",
+        "stt_ready": stt_ready,
+        "tts_ready": tts_ready,
         "port": 8888,
         "models": {
-            "stt": stt_loaded,
-            "kokoro": kokoro_loaded,
-            "piper": piper_loaded,
-            "rvc": rvc_ready,
+            "stt": stt_ready,
+            "piper": tts_ready,
+            "tts": tts_ready,
         },
-        "rvc": rvc_status,
         "modules": {
             "stt": "Sherpa-ONNX / Whisper-Base",
-            "tts": "Kokoro ONNX / Piper ONNX (100% Local Female Voices)",
-            "rvc": f"RVC v2 ({rvc_status['mode']})",
+            "tts": "Piper ONNX (100% Local Female Voice)",
             "vision": "RapidOCR ONNX UI Grounding",
             "ocr": "RapidOCR ONNX"
         }

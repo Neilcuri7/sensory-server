@@ -1,23 +1,27 @@
 """
-Tests unitarios para los endpoints de Sensory Server (FastAPI).
-Verifica:
-- Middleware de logging y propagación del header X-Request-ID.
-- Endpoint /health reportando estado de modelos y degradación.
-- Endpoint /v1/audio/transcriptions devolviendo HTTP 503 si el reconocedor no está disponible.
-- Capa 3: Detección elástica de hardware (GPU vs CPU) y session options.
-- Capa 3: Selector de motor y exposición de voces (/v1/audio/voices y /v1/audio/speech).
+Sensory Server Endpoint Unit and Integration Tests.
+Verifies:
+- GET /health reporting active_engine='piper', stt_ready, and tts_ready.
+- RequestLoggingMiddleware propagating X-Request-ID headers.
+- POST /v1/audio/speech and POST /tts returning pure 16-bit linear PCM at 22,050 Hz.
+- POST /v1/audio/speech/abort and POST /tts/abort returning 200.
+- POST /v1/audio/transcriptions and POST /stt transcribing cleanly.
+- Error handling (empty text/audio -> 400, unready engine -> 503).
 """
-import os
+from __future__ import annotations
+
+import base64
 import io
-import time
-import wave
-import threading
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
+import wave
+
 from fastapi.testclient import TestClient
 import numpy as np
 
 from app import app
+from domain.ports.speech_to_text import ISpeechToTextEngine, TranscriptionResult
+from domain.ports.text_to_speech import ITextToSpeechEngine, SynthesisResult
 import routers.stt_router as stt_router
 import routers.tts_router as tts_router
 
@@ -27,27 +31,127 @@ class TestSensoryEndpoints(unittest.TestCase):
         self.client = TestClient(app)
 
     def test_health_check_endpoint(self):
-        """Verifica la respuesta del health check con estructura de modelos y estado."""
+        """Verify GET /health reports status, active_engine='piper', and engine readiness."""
         response = self.client.get("/health")
         self.assertEqual(response.status_code, 200)
         data = response.json()
+
         self.assertIn("status", data)
-        self.assertIn(data["status"], ("healthy", "degraded", "down"))
+        self.assertIn(data["status"], ("ok", "degraded"))
+        self.assertEqual(data["active_engine"], "piper")
+        self.assertIn("stt_ready", data)
+        self.assertIn("tts_ready", data)
         self.assertIn("models", data)
-        self.assertIn("stt", data["models"])
-        self.assertIn("kokoro", data["models"])
         self.assertIn("piper", data["models"])
-        self.assertTrue("x-request-id" in response.headers or "X-Request-ID" in response.headers)
+        self.assertIn("stt", data["models"])
+        self.assertTrue("X-Request-ID" in response.headers or "x-request-id" in response.headers)
 
     def test_request_logging_middleware_preserves_custom_request_id(self):
-        """Verifica que si el cliente envía X-Request-ID, el middleware lo devuelva inalterado."""
-        custom_id = "test-req-12345"
+        """Verify X-Request-ID supplied by client is echoed in response headers."""
+        custom_id = "test-req-custom-999"
         response = self.client.get("/health", headers={"X-Request-ID": custom_id})
         returned_id = response.headers.get("X-Request-ID") or response.headers.get("x-request-id")
         self.assertEqual(returned_id, custom_id)
 
-    def test_stt_returns_503_when_recognizer_is_none(self):
-        """Verifica que si el reconocedor Whisper no carga, devuelva HTTP 503."""
+    def test_speech_endpoint_returns_pure_pcm(self):
+        """Verify POST /v1/audio/speech returns pure 16-bit linear PCM at 22,050 Hz."""
+        dummy_pcm = (np.sin(np.linspace(0, 100, 2205)) * 10000).astype(np.int16).tobytes()
+        mock_result = SynthesisResult(
+            pcm_bytes=dummy_pcm,
+            sample_rate=22050,
+            duration_ms=100.0,
+            latency_metrics={"inference_ms": 15.0},
+        )
+
+        mock_engine = MagicMock(spec=ITextToSpeechEngine)
+        mock_engine.is_ready.return_value = True
+        mock_engine.synthesize = AsyncMock(return_value=mock_result)
+
+        with patch.object(tts_router, "get_tts_engine", return_value=mock_engine):
+            response = self.client.post(
+                "/v1/audio/speech",
+                json={
+                    "model": "piper",
+                    "input": "Hola Rylai",
+                    "voice": "piper_f",
+                    "speed": 1.05,
+                    "generation_id": "gen_test_123",
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("audio/pcm", response.headers.get("Content-Type", ""))
+            self.assertEqual(response.headers.get("X-TTS-Engine"), "piper")
+            self.assertEqual(response.headers.get("X-TTS-Sample-Rate"), "22050")
+            self.assertEqual(response.content, dummy_pcm)
+            # Pure PCM has no RIFF/WAVE header
+            self.assertFalse(response.content.startswith(b"RIFF"))
+            self.assertEqual(len(response.content) % 2, 0)
+
+            mock_engine.synthesize.assert_called_once_with(
+                text="Hola Rylai",
+                speed=1.05,
+                generation_id="gen_test_123",
+            )
+
+    def test_tts_legacy_alias_endpoint_returns_pure_pcm(self):
+        """Verify POST /tts returns pure PCM matching POST /v1/audio/speech."""
+        dummy_pcm = (np.zeros(1000, dtype=np.int16)).tobytes()
+        mock_result = SynthesisResult(
+            pcm_bytes=dummy_pcm,
+            sample_rate=22050,
+            duration_ms=45.0,
+        )
+
+        mock_engine = MagicMock(spec=ITextToSpeechEngine)
+        mock_engine.is_ready.return_value = True
+        mock_engine.synthesize = AsyncMock(return_value=mock_result)
+
+        with patch.object(tts_router, "get_tts_engine", return_value=mock_engine):
+            response = self.client.post("/tts", json={"text": "Prueba de audio", "speed": 1.0})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.content, dummy_pcm)
+
+    def test_speech_endpoint_empty_text_returns_400(self):
+        """Verify empty input or text returns HTTP 400."""
+        response = self.client.post("/v1/audio/speech", json={"input": "   "})
+        self.assertEqual(response.status_code, 400)
+
+        response_tts = self.client.post("/tts", json={"text": ""})
+        self.assertEqual(response_tts.status_code, 400)
+
+    def test_speech_endpoint_unready_engine_returns_503(self):
+        """Verify HTTP 503 is returned when TTS engine is not ready."""
+        mock_engine = MagicMock(spec=ITextToSpeechEngine)
+        mock_engine.is_ready.return_value = False
+
+        with patch.object(tts_router, "get_tts_engine", return_value=mock_engine):
+            response = self.client.post("/v1/audio/speech", json={"input": "Texto cualquiera"})
+            self.assertEqual(response.status_code, 503)
+
+    def test_speech_abort_endpoints(self):
+        """Verify POST /v1/audio/speech/abort and POST /tts/abort invoke engine.abort."""
+        mock_engine = MagicMock(spec=ITextToSpeechEngine)
+        mock_engine.abort = AsyncMock()
+
+        with patch.object(tts_router, "get_tts_engine", return_value=mock_engine):
+            # 1. /v1/audio/speech/abort with JSON body
+            resp1 = self.client.post(
+                "/v1/audio/speech/abort",
+                json={"generation_id": "gen_abort_001"},
+            )
+            self.assertEqual(resp1.status_code, 200)
+            self.assertEqual(resp1.json(), {"status": "ok", "aborted": "gen_abort_001"})
+            mock_engine.abort.assert_called_with("gen_abort_001")
+
+            # 2. /tts/abort with query param
+            resp2 = self.client.post("/tts/abort?generation_id=gen_abort_002")
+            self.assertEqual(resp2.status_code, 200)
+            self.assertEqual(resp2.json(), {"status": "ok", "aborted": "gen_abort_002"})
+            mock_engine.abort.assert_called_with("gen_abort_002")
+
+    def test_transcriptions_endpoint_with_wav_file(self):
+        """Verify POST /v1/audio/transcriptions transcribes cleanly."""
+        # Create a synthetic WAV file
         wav_io = io.BytesIO()
         with wave.open(wav_io, "wb") as wf:
             wf.setnchannels(1)
@@ -56,760 +160,63 @@ class TestSensoryEndpoints(unittest.TestCase):
             wf.writeframes(b"\x00\x00" * 8000)
         wav_bytes = wav_io.getvalue()
 
-        with patch.object(stt_router, "get_recognizer", return_value=None):
-            files = {"file": ("test.wav", wav_bytes, "audio/wav")}
-            response = self.client.post("/v1/audio/transcriptions", files=files, data={"model": "whisper-base"})
+        mock_engine = MagicMock(spec=ISpeechToTextEngine)
+        mock_engine.is_ready.return_value = True
+        mock_engine.transcribe = AsyncMock(
+            return_value=TranscriptionResult(text="Hola Rylai", confidence=0.98, duration_ms=500.0)
+        )
+
+        with patch.object(stt_router, "get_stt_engine", return_value=mock_engine):
+            files = {"file": ("audio.wav", wav_bytes, "audio/wav")}
+            response = self.client.post("/v1/audio/transcriptions", files=files)
+            self.assertEqual(response.status_code, 200)
+            data = response.json()
+            self.assertEqual(data["text"], "Hola Rylai")
+
+    def test_transcriptions_endpoint_unready_engine_returns_503(self):
+        """Verify HTTP 503 is returned when STT engine is not loaded."""
+        mock_engine = MagicMock(spec=ISpeechToTextEngine)
+        mock_engine.is_ready.return_value = False
+
+        with patch.object(stt_router, "get_stt_engine", return_value=mock_engine):
+            files = {"file": ("test.wav", b"dummy_content", "audio/wav")}
+            response = self.client.post("/v1/audio/transcriptions", files=files)
             self.assertEqual(response.status_code, 503)
-            data = response.json()
-            self.assertIn("STT model not loaded", data.get("detail", ""))
 
-    def test_stt_recognizer_threads_and_hardware_elasticity(self):
-        """Verifica que get_recognizer configure num_threads = min(4, os.cpu_count() or 4) para P-cores."""
-        expected_threads = min(4, os.cpu_count() or 4)
-        with patch("sherpa_onnx.OfflineRecognizer.from_whisper") as mock_whisper:
-            mock_whisper.return_value = MagicMock()
-            saved_rec = stt_router.recognizer
-            try:
-                stt_router.recognizer = None
-                rec = stt_router.get_recognizer()
-                self.assertIsNotNone(rec)
-                self.assertTrue(mock_whisper.called)
-                _, kwargs = mock_whisper.call_args
-                self.assertEqual(kwargs.get("num_threads"), expected_threads)
-            finally:
-                stt_router.recognizer = saved_rec
+    def test_transcriptions_empty_file_returns_400(self):
+        """Verify empty audio upload returns HTTP 400."""
+        files = {"file": ("empty.wav", b"", "audio/wav")}
+        response = self.client.post("/v1/audio/transcriptions", files=files)
+        self.assertEqual(response.status_code, 400)
 
-    def test_tts_session_options_threads(self):
-        """Verifica que SessionOptions en CPU configure intra_op_num_threads = min(4, os.cpu_count() or 4) e inter_op=1."""
-        expected_threads = min(4, os.cpu_count() or 4)
-        sess_options = tts_router._get_elastic_session_options()
-        self.assertEqual(sess_options.intra_op_num_threads, expected_threads)
-        self.assertEqual(sess_options.inter_op_num_threads, 1)
-        self.assertEqual(sess_options.log_severity_level, 3)
+    def test_stt_json_endpoint(self):
+        """Verify POST /stt accepts base64 audio and returns transcription."""
+        pcm_bytes = b"\x00\x00" * 4000
+        b64_audio = base64.b64encode(pcm_bytes).decode("ascii")
 
-    def test_tts_hardware_detection_gpu_to_cpu_fallback(self):
-        """Verifica que si GPU falla o no está disponible, degrade limpiamente a CPUExecutionProvider."""
-        with patch("onnxruntime.get_available_providers", return_value=["CUDAExecutionProvider", "CPUExecutionProvider"]):
-            with patch("onnxruntime.InferenceSession") as mock_sess:
-                # Simular que el intento de GPU lanza excepción y luego el de CPU funciona
-                cpu_session_mock = MagicMock()
-                cpu_session_mock.get_providers.return_value = ["CPUExecutionProvider"]
-                mock_sess.side_effect = [RuntimeError("CUDA driver not found"), cpu_session_mock]
-
-                session, provider = tts_router._create_elastic_inference_session("dummy_model.onnx")
-                self.assertEqual(provider, "CPUExecutionProvider")
-                self.assertEqual(mock_sess.call_count, 2)
-
-    def test_voices_endpoint_exposes_piper_and_kokoro(self):
-        """Verifica que /v1/audio/voices exponga piper_f como bajo consumo en CPU y jf_alpha como alta fidelidad."""
-        response = self.client.get("/v1/audio/voices")
-        self.assertEqual(response.status_code, 200)
-        data = response.json()
-        self.assertIn("voices", data)
-        voices = data["voices"]
-        voice_ids = [v["id"] for v in voices]
-
-        # Verificar presencia de jf_alpha (Kokoro) y piper_f (Piper)
-        self.assertIn("jf_alpha", voice_ids)
-        self.assertIn("piper_f", voice_ids)
-
-        # Verificar metadata de piper_f
-        piper_meta = next(v for v in voices if v["id"] == "piper_f")
-        self.assertEqual(piper_meta.get("engine"), "piper")
-        self.assertIn("CPU", piper_meta.get("name", ""))
-        self.assertEqual(piper_meta.get("tier"), "low_consumption_cpu")
-
-        # Verificar metadata de jf_alpha
-        kokoro_meta = next(v for v in voices if v["id"] == "jf_alpha")
-        self.assertEqual(kokoro_meta.get("engine"), "kokoro")
-        self.assertEqual(kokoro_meta.get("tier"), "high_fidelity")
-
-    def test_speech_endpoint_engine_routing_piper(self):
-        """Verifica que model='piper' active el motor Piper para síntesis ultra-rápida."""
-        dummy_wav = tts_router._generate_wav_bytes(b"\x00" * 4410, sample_rate=22050)
-        fake_metrics = {
-            "voice": "piper_f",
-            "engine": "piper",
-            "lang": "es",
-            "chars": 4,
-            "lock_wait_ms": 1.0,
-            "infer_ms": 5.0,
-            "audio_dur_ms": 100.0,
-            "bytes": len(dummy_wav)
-        }
-        with patch.object(tts_router, "_synthesize_wav_sync", return_value=(dummy_wav, fake_metrics)) as mock_synth:
-            response = self.client.post("/v1/audio/speech", json={"model": "piper", "input": "Hola"})
-            self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.headers.get("X-TTS-Engine"), "piper")
-            self.assertEqual(response.headers.get("X-TTS-Voice"), "piper_f")
-            _, kwargs = mock_synth.call_args
-            self.assertEqual(kwargs.get("model"), "piper")
-
-    def test_anime_pitch_shift_benchmark_under_10ms(self):
-        """Verifica que _apply_anime_pitch_shift sobre 24000 muestras ejecute en tiempo conversacional (< 35ms en CPU)."""
-        sample_rate = 24000
-        # 1 segundo de audio sintético a 24kHz
-        samples = np.sin(2 * np.pi * 440 * np.linspace(0, 1, sample_rate, dtype=np.float32))
-
-        # Warm-up previo
-        tts_router._apply_anime_pitch_shift(samples, sample_rate, 2.0)
-
-        # Benchmark de ejecución
-        t_start = time.perf_counter()
-        shifted = tts_router._apply_anime_pitch_shift(samples, sample_rate, 2.0)
-        elapsed_ms = (time.perf_counter() - t_start) * 1000.0
-
-        # Verificación de rendimiento estricto (< 35 ms en virtualización WSL2)
-        self.assertLess(
-            elapsed_ms,
-            35.0,
-            f"El remuestreo tardó {elapsed_ms:.2f}ms, excediendo el límite de 35ms"
+        mock_engine = MagicMock(spec=ISpeechToTextEngine)
+        mock_engine.is_ready.return_value = True
+        mock_engine.transcribe = AsyncMock(
+            return_value=TranscriptionResult(text="Prueba JSON STT", confidence=1.0, duration_ms=250.0)
         )
 
-        # Verificaciones de sanidad y preservación estricta de tempo y duración
-        self.assertEqual(len(shifted), len(samples))
-        self.assertEqual(shifted.dtype, samples.dtype)
+        with patch.object(stt_router, "get_stt_engine", return_value=mock_engine):
+            response = self.client.post("/stt", json={"audio_base64": b64_audio, "sample_rate": 16000})
+            self.assertEqual(response.status_code, 200)
+            data = response.json()
+            self.assertEqual(data["status"], "ok")
+            self.assertEqual(data["text"], "Prueba JSON STT")
+            self.assertTrue(data["is_speech"])
 
-        # Casos borde: tono despreciable o array vacío
-        noop = tts_router._apply_anime_pitch_shift(samples, sample_rate, 0.0)
-        np.testing.assert_array_equal(noop, samples)
-
-        empty = np.array([], dtype=np.float32)
-        empty_shifted = tts_router._apply_anime_pitch_shift(empty, sample_rate, 2.0)
-        self.assertEqual(len(empty_shifted), 0)
-
-    def test_spanish_inverted_punctuation_preserved_and_markdown_stripped(self):
-        """Verifica que ¿ y ¡ se preserven para espeak-ng, mientras se eliminan roleplay, emojis y markdown."""
-        raw_text = "*sonríe con emoción* ¡Hola mundo! ¿Cómo estás hoy? 🌸✨ Mira esto: https://example.com ```código en bloque``` **genial** # Título ~tachado~"
-        cleaned = tts_router._sanitize_text_for_tts(raw_text)
-        # ¿ e ¡ deben preservarse intactos
-        self.assertIn("¿Cómo estás hoy?", cleaned)
-        self.assertIn("¡Hola mundo!", cleaned)
-        # *sonríe con emoción* debe eliminarse por completo (no leerse)
-        self.assertNotIn("sonríe", cleaned)
-        # Emojis eliminados
-        self.assertNotIn("🌸", cleaned)
-        self.assertNotIn("✨", cleaned)
-        # URLs y bloques de código eliminados
-        self.assertNotIn("https://", cleaned)
-        self.assertNotIn("código en bloque", cleaned)
-        self.assertNotIn("*", cleaned)
-        self.assertNotIn("#", cleaned)
-
-    def test_detect_phoneme_lang_prefers_spanish(self):
-        """Verifica que voces jf_* no fuercen fonemas japoneses 'ja' en texto latino/español."""
-        # En español no debe devolver 'ja'
-        self.assertEqual(tts_router._detect_phoneme_lang("Hola amigo, ¿cómo estás?", "jf_alpha"), "es")
-        self.assertEqual(tts_router._detect_phoneme_lang("Buenos días", "ef_dora"), "es")
-        # Solo en presencia de caracteres japoneses devuelve 'ja'
-        self.assertEqual(tts_router._detect_phoneme_lang("こんにちは", "jf_alpha"), "ja")
-        # Idioma explícito
-        self.assertEqual(tts_router._detect_phoneme_lang("Hello friend", "af_bella", requested_lang="en-us"), "en-us")
-
-    def test_soft_limiting_peak_normalization(self):
-        """Verifica que _write_wav_bytes aplique soft-limiting cuando el pico supera 0.98."""
-        loud_samples = np.array([0.0, 1.5, -1.8, 0.5], dtype=np.float32)
-        wav_bytes = tts_router._write_wav_bytes(loud_samples, sample_rate=24000)
-        read_samples, sr = tts_router._read_wav_samples(wav_bytes)
-        self.assertEqual(sr, 24000)
-        # El pico normalizado debe ser <= 1.0 (sin clipping digital de techo plano)
-        self.assertLessEqual(float(np.max(np.abs(read_samples))), 1.0)
-
-    def test_kokoro_voice_blending_resolution(self):
-        """Verifica que _resolve_kokoro_voice mezcle ef_dora + jf_alpha para español anime."""
-        mock_kokoro = MagicMock()
-        mock_kokoro.get_voices.return_value = ["ef_dora", "jf_alpha", "jf_nezumi"]
-        mock_kokoro.get_voice_style.side_effect = lambda name: np.ones((510, 1, 256), dtype=np.float32) * (1.0 if name == "ef_dora" else 2.0)
-
-        # Caso ef_blend o jf_alpha en español: debe devolver el vector de estilo mezclado
-        blended = tts_router._resolve_kokoro_voice(mock_kokoro, "jf_alpha", "es")
-        self.assertIsInstance(blended, np.ndarray)
-        self.assertEqual(blended.shape, (510, 1, 256))
-        # 0.70 * 1.0 + 0.30 * 2.0 = 1.30
-        expected_val = 0.70 * 1.0 + 0.30 * 2.0
-        np.testing.assert_allclose(blended[0, 0, 0], expected_val, atol=1e-5)
-
-        # Fallback si kokoro no tiene get_voice_style (mock simple de test)
-        simple_mock = MagicMock(spec=["create"])
-        fallback_voice = tts_router._resolve_kokoro_voice(simple_mock, "jf_alpha", "es")
-        self.assertEqual(fallback_voice, "jf_alpha")
-
-    def test_voices_endpoint_includes_ef_blend(self):
-        """Verifica que /v1/audio/voices incluya la voz ef_blend."""
+    def test_voices_endpoint_returns_piper(self):
+        """Verify GET /v1/audio/voices exposes Piper default voice."""
         response = self.client.get("/v1/audio/voices")
         self.assertEqual(response.status_code, 200)
         data = response.json()
+        self.assertEqual(data["default_engine"], "piper")
+        self.assertEqual(data["default_voice"], "piper_f")
         voice_ids = [v["id"] for v in data["voices"]]
-        self.assertIn("ef_blend", voice_ids)
-
-    def test_load_kokoro_graceful_none_in_light_tier_when_files_missing(self):
-        """Verifica que _load_kokoro en light tier retorne None limpiamente sin error si los pesos no existen."""
-        with patch.dict(os.environ, {"SENSORY_TIER": "light"}):
-            with patch("os.path.exists", return_value=False):
-                orig_kokoro = tts_router.kokoro_voice
-                orig_model = tts_router._kokoro_model
-                try:
-                    tts_router.kokoro_voice = None
-                    tts_router._kokoro_model = None
-                    result = tts_router._load_kokoro()
-                    self.assertIsNone(result)
-                    self.assertIsNone(tts_router.kokoro_voice)
-                    self.assertIsNone(tts_router._kokoro_model)
-                finally:
-                    tts_router.kokoro_voice = orig_kokoro
-                    tts_router._kokoro_model = orig_model
-
-    def test_voices_endpoint_in_light_tier_defaults_to_piper(self):
-        """Verifica que /v1/audio/voices en SENSORY_TIER=light devuelva default_engine='piper' y default_voice='piper_f'."""
-        with patch.dict(os.environ, {"SENSORY_TIER": "light"}):
-            response = self.client.get("/v1/audio/voices")
-            self.assertEqual(response.status_code, 200)
-            data = response.json()
-            self.assertEqual(data.get("default_engine"), "piper")
-            self.assertEqual(data.get("default_voice"), "piper_f")
-            self.assertEqual(data.get("tier"), "light")
-
-    def test_speech_endpoint_light_tier_routes_to_piper_automatically(self):
-        """Verifica que peticiones a /v1/audio/speech y /tts en light tier se enruten a Piper incluso si piden Kokoro."""
-        dummy_wav = tts_router._generate_wav_bytes(b"\x00" * 4410, sample_rate=22050)
-        fake_metrics = {
-            "voice": "piper_f",
-            "engine": "piper",
-            "lang": "es",
-            "chars": 4,
-            "lock_wait_ms": 1.0,
-            "infer_ms": 5.0,
-            "audio_dur_ms": 100.0,
-            "bytes": len(dummy_wav)
-        }
-        with patch.dict(os.environ, {"SENSORY_TIER": "light"}):
-            with patch.object(tts_router, "_synthesize_wav_sync", return_value=(dummy_wav, fake_metrics)) as mock_synth:
-                # 1. /v1/audio/speech con model="kokoro" y voice="jf_alpha"
-                resp = self.client.post("/v1/audio/speech", json={"model": "kokoro", "voice": "jf_alpha", "input": "Hola"})
-                self.assertEqual(resp.status_code, 200)
-                self.assertEqual(resp.headers.get("X-TTS-Engine"), "piper")
-                self.assertEqual(resp.headers.get("X-TTS-Voice"), "piper_f")
-                _, kwargs = mock_synth.call_args
-                self.assertEqual(kwargs.get("model"), "piper")
-
-                # 2. /tts con model="kokoro"
-                resp_tts = self.client.post("/tts", json={"model": "kokoro", "voice": "jf_alpha", "text": "Hola"})
-                self.assertEqual(resp_tts.status_code, 200)
-                data_tts = resp_tts.json()
-                self.assertEqual(data_tts.get("engine"), "piper")
-                self.assertEqual(data_tts.get("voice"), "piper_f")
-
-    def test_synthesize_wav_sync_light_tier_uses_piper(self):
-        """Verifica que _synthesize_wav_sync y el alias synthesize_tts usen Piper sin invocar Kokoro en light tier."""
-        mock_piper = MagicMock()
-        mock_chunk = MagicMock()
-        mock_chunk.audio_int16_bytes = b"\x00\x00" * 2205
-        mock_piper.synthesize.return_value = [mock_chunk]
-        mock_piper.config.sample_rate = 22050
-
-        with patch.dict(os.environ, {"SENSORY_TIER": "light"}):
-            with patch.object(tts_router, "get_piper_voice", return_value=mock_piper):
-                with patch.object(tts_router, "get_kokoro_voice") as mock_kokoro:
-                    wav_bytes, metrics = tts_router.synthesize_tts("Hola mundo", "jf_alpha", 1.0)
-                    self.assertGreater(len(wav_bytes), 44)
-                    self.assertEqual(metrics["engine"], "piper")
-                    self.assertEqual(metrics["voice"], "piper_f")
-                    self.assertFalse(mock_kokoro.called)
-
-    def test_health_endpoint_healthy_in_light_tier_with_only_stt_and_piper(self):
-        """Verifica que /health reporte 'healthy' en light tier cuando solo stt y piper están cargados (kokoro omitido)."""
-        with patch.dict(os.environ, {"SENSORY_TIER": "light"}):
-            with patch.object(stt_router, "recognizer", MagicMock()):
-                with patch.object(tts_router, "piper_voice", MagicMock()):
-                    with patch.object(tts_router, "kokoro_voice", None):
-                        response = self.client.get("/health")
-                        self.assertEqual(response.status_code, 200)
-                        data = response.json()
-                        self.assertEqual(data["status"], "healthy")
-                        self.assertEqual(data["tier"], "light")
-                        self.assertFalse(data["models"]["kokoro"])
-                        self.assertTrue(data["models"]["piper"])
-                        self.assertTrue(data["models"]["stt"])
-
-    def test_kokoro_concurrent_requests_serialized_by_lock(self):
-        """Verifica que llamadas concurrentes con Kokoro se serialicen mediante _espeak_piper_lock evitando carreras en espeak-ng."""
-        active_calls = 0
-        max_concurrent_calls = 0
-        call_lock = threading.Lock()
-        results = []
-
-        def mock_create(text, voice=None, speed=1.0, lang="es"):
-            nonlocal active_calls, max_concurrent_calls
-            with call_lock:
-                active_calls += 1
-                if active_calls > max_concurrent_calls:
-                    max_concurrent_calls = active_calls
-            # Pausa artificial para forzar colisión si no existiese el lock global
-            time.sleep(0.04)
-            with call_lock:
-                active_calls -= 1
-            return np.zeros(2400, dtype=np.float32), 24000
-
-        mock_kokoro = MagicMock()
-        mock_kokoro.get_voices.return_value = ["jf_alpha", "ef_dora"]
-        mock_kokoro.create.side_effect = mock_create
-
-        def run_worker(text_payload):
-            wav, metrics = tts_router._synthesize_wav_sync(
-                text=text_payload,
-                voice_id="jf_alpha",
-                speed=1.0,
-                language="es",
-                pitch_semitones=2.0,
-                model="kokoro"
-            )
-            results.append((wav, metrics))
-
-        with patch.dict(os.environ, {"SENSORY_TIER": "full"}):
-            with patch.object(tts_router, "get_kokoro_voice", return_value=mock_kokoro):
-                t1 = threading.Thread(target=run_worker, args=("Primera oración de prueba concurrente.",))
-                t2 = threading.Thread(target=run_worker, args=("Segunda oración de prueba concurrente.",))
-
-                t1.start()
-                t2.start()
-                t1.join()
-                t2.join()
-
-        # Ambas síntesis deben haber culminado con éxito
-        self.assertEqual(len(results), 2)
-        for wav, metrics in results:
-            self.assertEqual(metrics["engine"], "kokoro")
-            self.assertGreater(len(wav), 44)
-
-        # La concurrencia máxima en kokoro.create debe ser estrictamente 1 (cero carreras)
-        self.assertEqual(max_concurrent_calls, 1, f"Condición de carrera detectada: max concurrent={max_concurrent_calls}")
-
-        # Al menos uno de los hilos debió registrar tiempo de espera de lock (> 0ms)
-        lock_waits = [metrics["lock_wait_ms"] for _, metrics in results]
-        self.assertTrue(any(w > 10.0 for w in lock_waits), f"Ningún hilo esperó en cola de lock: {lock_waits}")
-
-    def test_ef_dora_pure_spanish_resolution_and_zero_default_pitch(self):
-        """Verifica que ef_dora resuelva pura sin mezcla y use pitch 0.0 por defecto en /tts y /v1/audio/speech."""
-        mock_kokoro = MagicMock()
-        mock_kokoro.get_voices.return_value = ["ef_dora", "jf_alpha"]
-        mock_kokoro.get_voice_style.return_value = np.ones((510, 1, 256), dtype=np.float32)
-
-        # 1. Resolución pura de ef_dora
-        resolved = tts_router._resolve_kokoro_voice(mock_kokoro, "ef_dora", "es")
-        self.assertEqual(resolved, "ef_dora")
-        self.assertIsInstance(resolved, str)
-        # get_voice_style no debe llamarse para ef_dora
-        mock_kokoro.get_voice_style.assert_not_called()
-
-        # Comparar con ef_blend o jf_alpha que sí deben mezclar
-        blended = tts_router._resolve_kokoro_voice(mock_kokoro, "ef_blend", "es")
-        self.assertIsInstance(blended, np.ndarray)
-        self.assertTrue(mock_kokoro.get_voice_style.called)
-
-        # 2. Pitch 0.0 por defecto en /tts para ef_dora sin pitch explícito
-        dummy_wav = tts_router._generate_wav_bytes(b"\x00" * 4410, sample_rate=24000)
-        fake_metrics = {
-            "voice": "ef_dora",
-            "engine": "kokoro",
-            "lang": "es",
-            "chars": 4,
-            "lock_wait_ms": 0.0,
-            "infer_ms": 10.0,
-            "audio_dur_ms": 100.0,
-            "bytes": len(dummy_wav)
-        }
-        with patch.dict(os.environ, {"SENSORY_TIER": "full"}):
-            with patch.object(tts_router, "_synthesize_wav_sync", return_value=(dummy_wav, fake_metrics)) as mock_synth:
-                # /tts con ef_dora sin pitch_semitones
-                resp_dora = self.client.post("/tts", json={"voice": "ef_dora", "text": "Hola, soy Dora."})
-                self.assertEqual(resp_dora.status_code, 200)
-                args_dora, kwargs_dora = mock_synth.call_args
-                passed_pitch_dora = args_dora[4] if len(args_dora) > 4 else kwargs_dora.get("pitch_semitones")
-                self.assertEqual(passed_pitch_dora, 0.0)
-
-                mock_synth.reset_mock()
-                # /tts con voz anime jf_alpha sin pitch explícito -> mantiene 2.0
-                resp_anime = self.client.post("/tts", json={"voice": "jf_alpha", "text": "Konnichiwa!"})
-                self.assertEqual(resp_anime.status_code, 200)
-                args_anime, kwargs_anime = mock_synth.call_args
-                passed_pitch_anime = args_anime[4] if len(args_anime) > 4 else kwargs_anime.get("pitch_semitones")
-                self.assertEqual(passed_pitch_anime, 2.0)
-
-                mock_synth.reset_mock()
-                # /v1/audio/speech con ef_dora sin pitch explícito -> usa 0.0
-                resp_speech = self.client.post("/v1/audio/speech", json={"voice": "ef_dora", "input": "Hola, soy Dora."})
-                self.assertEqual(resp_speech.status_code, 200)
-                args_speech, kwargs_speech = mock_synth.call_args
-                passed_pitch_speech = args_speech[4] if len(args_speech) > 4 else kwargs_speech.get("pitch_semitones")
-                self.assertEqual(passed_pitch_speech, 0.0)
-
-                mock_synth.reset_mock()
-                # /tts con ef_dora con pitch_semitones explícito -> respeta el valor explícito
-                resp_explicit = self.client.post("/tts", json={"voice": "ef_dora", "text": "Hola", "pitch_semitones": 1.2})
-                self.assertEqual(resp_explicit.status_code, 200)
-                args_exp, kwargs_exp = mock_synth.call_args
-                passed_pitch_exp = args_exp[4] if len(args_exp) > 4 else kwargs_exp.get("pitch_semitones")
-                self.assertEqual(passed_pitch_exp, 1.2)
-
-    def test_tts_l1_l2_cache_roundtrip_and_fast_hit(self):
-        """Verifica que el caché SHA-256 almacene en L1 RAM + L2 disco y sirva aciertos instantáneos sin adquirir lock."""
-        import tempfile
-        dummy_wav = tts_router._write_wav_bytes(np.ones(2400, dtype=np.float32) * 0.25, sample_rate=24000)
-
-        with tempfile.TemporaryDirectory() as tmp_cache_dir:
-            with patch.object(tts_router, "TTS_CACHE_DIR", tmp_cache_dir):
-                tts_router._tts_ram_cache.clear()
-                key = tts_router._compute_tts_cache_key("¡Hola! Aquí estoy contigo.", "ef_dora", "es", 1.05, 0.0, "kokoro")
-                self.assertIsNone(tts_router.get_cached_tts_wav(key))
-
-                # Guardar en L1 y L2
-                tts_router.store_cached_tts_wav(key, dummy_wav)
-                disk_file = os.path.join(tmp_cache_dir, f"{key}.wav")
-                self.assertTrue(os.path.exists(disk_file))
-
-                # L1 hit
-                hit_l1 = tts_router.get_cached_tts_wav(key)
-                self.assertEqual(hit_l1, dummy_wav)
-
-                # Limpiar L1 para verificar promoción desde L2 (disco)
-                tts_router._tts_ram_cache.clear()
-                hit_l2 = tts_router.get_cached_tts_wav(key)
-                self.assertEqual(hit_l2, dummy_wav)
-                self.assertIn(key, tts_router._tts_ram_cache)
-
-                # Verificar que _synthesize_wav_sync devuelva cache_hit=True en <2ms sin invocar inferencia
-                wav_out, metrics = tts_router._synthesize_wav_sync(
-                    text="¡Hola! Aquí estoy contigo.",
-                    voice_id="ef_dora",
-                    speed=1.05,
-                    language="es",
-                    pitch_semitones=0.0,
-                    model="kokoro"
-                )
-                self.assertEqual(wav_out, dummy_wav)
-                self.assertTrue(metrics.get("cache_hit"))
-                self.assertEqual(metrics.get("lock_wait_ms"), 0.0)
-                self.assertLess(metrics.get("infer_ms", 999.0), 5.0)
-                tts_router._tts_ram_cache.clear()
-
-    def test_trim_dead_silence_removes_padding_and_preserves_pure_zeros(self):
-        """Verifica que _trim_dead_silence recorte silencios extremos preservando 20ms de margen e ignore arrays puros de ceros."""
-        sr = 24000
-        # 1. Silencio puro (como en mocks): debe devolverse intacto sin recortar
-        pure_zeros = np.zeros(2400, dtype=np.float32)
-        trimmed_zeros = tts_router._trim_dead_silence(pure_zeros, sr)
-        self.assertEqual(len(trimmed_zeros), 2400)
-
-        # 2. Señal con 5000 muestras de silencio al inicio y 5000 al final, y 4000 activas en el centro
-        signal = np.concatenate([
-            np.zeros(5000, dtype=np.float32),
-            np.ones(4000, dtype=np.float32) * 0.5,
-            np.zeros(5000, dtype=np.float32),
-        ])
-        trimmed = tts_router._trim_dead_silence(signal, sr, threshold=0.006, pad_ms=20)
-        pad_samples = int(0.020 * sr)  # 480 muestras
-        expected_len = 4000 + 2 * pad_samples
-        self.assertEqual(len(trimmed), expected_len)
-
-    def test_stt_preprocess_audio_and_domain_lexicon_corrections(self):
-        """Verifica el acondicionamiento DSP (resample_poly + auto-gain) y la corrección fonética de 'Rylai'."""
-        # 1. Corrección fonética de variantes hispanas de Whisper
-        raw_transcript = "hola rilai, ¿cómo estás rilay? oye railai y raily"
-        corrected = stt_router._apply_domain_lexicon_corrections(raw_transcript)
-        self.assertEqual(corrected, "hola Rylai, ¿cómo estás Rylai? oye Rylai y Rylai")
-
-        # 2. Preprocesamiento de señal estéreo a 48kHz con volumen bajo (pico 0.10) y DC offset
-        sr_in = 48000
-        t = np.linspace(0, 0.5, sr_in // 2, dtype=np.float32)
-        quiet_sine = (np.sin(2 * np.pi * 440 * t) * 0.10) + 0.05  # pico ~0.10 + DC offset 0.05
-        stereo_signal = np.column_stack([quiet_sine, quiet_sine])
-
-        processed, sr_out = stt_router._preprocess_stt_audio(stereo_signal, sr_in)
-        self.assertEqual(sr_out, 16000)
-        self.assertEqual(len(processed.shape), 1)
-        self.assertAlmostEqual(float(np.mean(processed)), 0.0, places=2)
-        # Auto-gain debe haber elevado el pico cerca de 0.89
-        self.assertGreater(float(np.max(np.abs(processed))), 0.80)
-        self.assertLessEqual(float(np.max(np.abs(processed))), 0.95)
-
-    def test_piper_voice_defaults_to_zero_pitch(self):
-        """Verifica que piper_f use pitch 0.0 por defecto para evitar artefactos metálicos OLA."""
-        dummy_wav = tts_router._generate_wav_bytes(b"\x00" * 4410, sample_rate=22050)
-        fake_metrics = {
-            "voice": "piper_f",
-            "engine": "piper",
-            "lang": "es",
-            "chars": 4,
-            "lock_wait_ms": 0.0,
-            "infer_ms": 5.0,
-            "audio_dur_ms": 100.0,
-            "bytes": len(dummy_wav)
-        }
-
-        with patch.object(tts_router, "_synthesize_wav_sync", return_value=(dummy_wav, fake_metrics)) as mock_synth:
-            # 1. /tts con piper_f sin pitch explícito -> debe pasar pitch 0.0
-            resp_tts = self.client.post("/tts", json={"voice": "piper_f", "text": "Hola Piper"})
-            self.assertEqual(resp_tts.status_code, 200)
-            args, kwargs = mock_synth.call_args
-            passed_pitch = args[4] if len(args) > 4 else kwargs.get("pitch_semitones")
-            self.assertEqual(passed_pitch, 0.0)
-
-            mock_synth.reset_mock()
-            # 2. /v1/audio/speech con piper_f sin pitch explícito -> debe pasar pitch 0.0
-            resp_speech = self.client.post("/v1/audio/speech", json={"voice": "piper_f", "input": "Hola Piper"})
-            self.assertEqual(resp_speech.status_code, 200)
-            args, kwargs = mock_synth.call_args
-            passed_pitch = args[4] if len(args) > 4 else kwargs.get("pitch_semitones")
-            self.assertEqual(passed_pitch, 0.0)
-
-            mock_synth.reset_mock()
-            # 3. En tier light: petición con jf_alpha y pitch 2.0 (default anime de Kokoro) debe auto-anular el pitch a 0.0
-            with patch.dict(os.environ, {"SENSORY_TIER": "light"}):
-                resp_light = self.client.post("/tts", json={"voice": "jf_alpha", "text": "Hola", "pitch_semitones": 2.0})
-                self.assertEqual(resp_light.status_code, 200)
-                args, kwargs = mock_synth.call_args
-                passed_pitch = args[4] if len(args) > 4 else kwargs.get("pitch_semitones")
-                self.assertEqual(passed_pitch, 0.0)
-
-    def test_piper_output_natural_timbre_without_eq(self):
-        """Verifica que el pipeline preserve el timbre y entonación natural de Piper sin distorsión DSP/EQ."""
-        sample_rate = 22050
-        samples = np.sin(2 * np.pi * 440 * np.linspace(0, 1, sample_rate, dtype=np.float32))
-        trimmed = tts_router._trim_dead_silence(samples, sample_rate)
-        self.assertEqual(len(trimmed), len(samples))
-
-    def test_apply_rvc_conversion_nino_and_miku_and_disabled(self):
-        """Verifica que apply_rvc_conversion ejecute inferencia neuronal cuando neural_ready=True o retorne base limpia si no está lista."""
-        from rvc_engine import apply_rvc_conversion, get_wav_info
-
-        sr = 24000
-        t = np.linspace(0, 0.4, int(sr * 0.4), endpoint=False)
-        audio = (0.5 * np.sin(2 * np.pi * 330 * t) + 0.2 * np.sin(2 * np.pi * 660 * t)).astype(np.float32)
-        orig_wav = tts_router._write_wav_bytes(audio, sample_rate=sr)
-
-        # 1. Nino Nakano con neural_ready simulado
-        converted_dummy = tts_router._write_wav_bytes(audio * 0.95, sample_rate=sr)
-        with patch("rvc_engine.rvc_pipeline.get_rvc_engine_status", return_value={"neural_ready": True, "mode": "neural"}):
-            with patch("rvc_engine.rvc_pipeline._run_neural_rvc_inference", return_value=(converted_dummy, {"rvc_applied": True, "voice": "Nino Nakano", "mode": "neural", "sr": sr})):
-                out_nino, meta_nino = apply_rvc_conversion(orig_wav, "Nino Nakano")
-                self.assertTrue(meta_nino.get("rvc_applied"))
-                self.assertEqual(meta_nino.get("voice"), "Nino Nakano")
-                self.assertEqual(meta_nino.get("mode"), "neural")
-                sr_nino, frames_nino = get_wav_info(out_nino)
-                self.assertGreater(sr_nino, 0)
-                self.assertGreater(frames_nino, 0)
-
-        # 2. Miku Nakano con neural_ready = False -> Fallback limpio base sin distorsión DSP
-        out_fallback, meta_fallback = apply_rvc_conversion(orig_wav, "Miku Nakano")
-        self.assertFalse(meta_fallback.get("rvc_applied"))
-        self.assertEqual(meta_fallback.get("reason"), "neural_not_ready")
-        self.assertEqual(out_fallback, orig_wav)
-
-        # 3. none / off
-        out_none, meta_none = apply_rvc_conversion(orig_wav, "none")
-        self.assertFalse(meta_none.get("rvc_applied"))
-        self.assertEqual(out_none, orig_wav)
-
-        # 4. NonExistentVoice
-        out_fake, meta_fake = apply_rvc_conversion(orig_wav, "NonExistentVoice")
-        self.assertFalse(meta_fake.get("rvc_applied"))
-        self.assertEqual(out_fake, orig_wav)
-
-    def test_synthesize_sentence_wav_bytes_with_rvc_undistorted_base_and_cache(self):
-        """Verifica que la síntesis con RVC use base ef_dora, pitch 0.0, engine '+rvc', y caché consistente."""
-        from unittest.mock import patch
-
-        class DummyKokoro:
-            def get_voices(self):
-                return ["ef_dora", "jf_alpha"]
-
-            def get_voice_style(self, v):
-                return np.zeros(256, dtype=np.float32)
-
-            def create(self, text, voice="ef_dora", speed=1.0, lang="es"):
-                sr = 24000
-                samples = (0.4 * np.sin(2 * np.pi * 440 * np.linspace(0, 0.3, int(sr * 0.3)))).astype(np.float32)
-                return samples, sr
-
-        dummy_inst = DummyKokoro()
-
-        def dummy_getter():
-            return dummy_inst
-
-        text = "Prueba de síntesis de voz con RVC activo para Aoi."
-        dummy_rvc_wav = tts_router._write_wav_bytes(
-            (0.4 * np.sin(2 * np.pi * 500 * np.linspace(0, 0.3, int(24000 * 0.3)))).astype(np.float32), 24000
-        )
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmp_cache_dir:
-            with patch.object(tts_router, "TTS_CACHE_DIR", tmp_cache_dir):
-                with patch.object(tts_router, "get_kokoro_voice", dummy_getter):
-                    with patch("rvc_engine.apply_rvc_conversion", return_value=(dummy_rvc_wav, {"rvc_applied": True, "voice": "Nino Nakano", "mode": "neural"})) as mock_rvc:
-                        with patch.dict(os.environ, {"SENSORY_TIER": "full"}):
-                            # Limpiar cualquier residuo de caché RAM para la clave
-                            tts_router._tts_ram_cache.clear()
-
-                            # Llamada 1: primera síntesis (cache miss)
-                            wav1, metrics1 = tts_router._synthesize_wav_sync(
-                                text=text,
-                                voice_id="anime_es",
-                                speed=1.0,
-                                language="es",
-                                pitch_semitones=2.0,  # debe ser forzado a 0.0 por rvc_active
-                                model="kokoro",
-                                rvc_voice="Nino Nakano",
-                            )
-                            # Verificar que rvc_pitch pasado a apply_rvc_conversion fue 0.0
-                            self.assertEqual(mock_rvc.call_args[1].get("pitch_semitones", 0.0), 0.0)
-                            self.assertTrue(metrics1["engine"].endswith("+rvc"))
-                            self.assertFalse(metrics1.get("cache_hit", False))
-                            # Verificar que el base voice fue ef_dora
-                            self.assertEqual(metrics1["voice"], "ef_dora")
-
-                            # Llamada 2: segunda síntesis con mismos argumentos -> debe dar cache_hit
-                            wav2, metrics2 = tts_router._synthesize_wav_sync(
-                                text=text,
-                                voice_id="anime_es",
-                                speed=1.0,
-                                language="es",
-                                pitch_semitones=2.0,
-                                model="kokoro",
-                                rvc_voice="Nino Nakano",
-                            )
-                            self.assertTrue(metrics2.get("cache_hit", False), f"metrics2 cache_hit was False: {metrics2}")
-                            self.assertTrue(metrics2["engine"].endswith("+rvc"))
-                            self.assertEqual(wav1, wav2)
-
-    def test_synthesize_rvc_failure_does_not_poison_cache(self):
-        """Verifica que si la conversión RVC falla (rvc_applied=False), NO se envenene la caché."""
-        from unittest.mock import patch, MagicMock
-        import tempfile
-
-        sr = 24000
-        audio = (0.4 * np.sin(2 * np.pi * 440 * np.linspace(0, 0.3, int(sr * 0.3)))).astype(np.float32)
-        mock_kokoro = MagicMock()
-        mock_kokoro.get_voices.return_value = ["ef_dora", "jf_alpha"]
-        mock_kokoro.create.return_value = (audio, sr)
-
-        text = "Texto para prueba de fallo RVC y protección de caché."
-
-        with tempfile.TemporaryDirectory() as tmp_cache_dir:
-            with patch.object(tts_router, "TTS_CACHE_DIR", tmp_cache_dir):
-                with patch.object(tts_router, "get_kokoro_voice", return_value=mock_kokoro):
-                    # Forzar fallo simulado de apply_rvc_conversion
-                    with patch("rvc_engine.apply_rvc_conversion", return_value=(b"raw_unconverted_audio_dummy_44_bytes_padding", {"rvc_applied": False})):
-                        wav, metrics = tts_router._synthesize_wav_sync(
-                            text=text,
-                            voice_id="ef_dora",
-                            speed=1.0,
-                            language="es",
-                            pitch_semitones=0.0,
-                            model="kokoro",
-                            rvc_voice="Nino Nakano",
-                        )
-                        # Al fallar RVC, engine_used no debe terminar en +rvc
-                        self.assertFalse(metrics["engine"].endswith("+rvc"))
-
-                        # Verificar que no quedó guardado en caché para 'ef_dora+Nino Nakano'
-                        cache_key = tts_router._compute_tts_cache_key(
-                            tts_router._sanitize_text_for_tts(text),
-                            "ef_dora+Nino Nakano",
-                            "es",
-                            1.0,
-                            0.0,
-                            "kokoro+rvc"
-                        )
-                        cached = tts_router.get_cached_tts_wav(cache_key)
-                        self.assertIsNone(cached, "La caché fue envenenada con audio sin convertir cuando rvc_applied era False!")
-
-    def test_tts_endpoint_accurate_sample_rate_and_rvc(self):
-        """Verifica que /tts con rvc_voice devuelva HTTP 200, engine '+rvc', y sample_rate correspondiente al WAV."""
-        import base64
-        import tempfile
-        dummy_rvc_wav = tts_router._generate_wav_bytes(b"\x00" * 4800, sample_rate=24000)
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            with patch.object(tts_router, "TTS_CACHE_DIR", tmp_dir):
-                tts_router._tts_ram_cache.clear()
-                with patch("rvc_engine.apply_rvc_conversion", return_value=(dummy_rvc_wav, {"rvc_applied": True, "voice": "Nino Nakano", "mode": "neural"})):
-                    resp = self.client.post("/tts", json={
-                        "text": "Hola, probando endpoint TTS con voz RVC Nino Nakano.",
-                        "voice": "ef_dora",
-                        "rvc_voice": "Nino Nakano",
-                    })
-                    self.assertEqual(resp.status_code, 200)
-                    data = resp.json()
-                    self.assertEqual(data["status"], "ok")
-                    self.assertIn("+rvc", data["engine"])
-                    self.assertIn("audio_base64", data)
-
-                    wav_bytes = base64.b64decode(data["audio_base64"])
-                    sr_header, _ = tts_router._get_wav_info(wav_bytes)
-                    self.assertEqual(data["sample_rate"], sr_header)
-
-    def test_voices_endpoint_exposes_rvc_voices_and_status(self):
-        """Verifica que /tts/voices y /v1/audio/voices expongan rvc_voices y rvc_status."""
-        for path in ("/tts/voices", "/v1/audio/voices"):
-            resp = self.client.get(path)
-            self.assertEqual(resp.status_code, 200)
-            data = resp.json()
-            self.assertIn("rvc_voices", data)
-            self.assertIn("Nino Nakano", data["rvc_voices"])
-            self.assertIn("Miku Nakano", data["rvc_voices"])
-            self.assertIn("rvc_status", data)
-            self.assertIn("mode", data["rvc_status"])
-
-    def test_piper_e2e_with_all_rvc_voices_and_endpoints(self):
-        """Test E2E que verifica la síntesis real con Piper + RVC para Nino Nakano y Miku Nakano en /tts y /v1/audio/speech."""
-        import base64
-        import tempfile
-        from rvc_engine import discover_rvc_models, get_wav_info
-
-        rvc_models = discover_rvc_models()
-        self.assertIn("Nino Nakano", rvc_models)
-        self.assertIn("Miku Nakano", rvc_models)
-
-        def _mock_rvc(wav_bytes, rvc_voice, pitch_semitones=0.0, **kwargs):
-            return wav_bytes, {"rvc_applied": True, "voice": rvc_voice, "mode": "neural"}
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            with patch.object(tts_router, "TTS_CACHE_DIR", tmp_dir):
-                tts_router._tts_ram_cache.clear()
-                with patch.dict(os.environ, {"SENSORY_TIER": "light"}):
-                    with patch("rvc_engine.apply_rvc_conversion", side_effect=_mock_rvc) as mock_rvc:
-                        for rvc_name in ("Nino Nakano", "Miku Nakano"):
-                            # 1. Endpoint /tts con rvc_voice explícito en tier light (Piper)
-                            resp_tts = self.client.post("/tts", json={
-                                "text": f"Hola, esta es una prueba de Piper con la voz de {rvc_name}.",
-                                "model": "piper",
-                                "voice": "piper_f",
-                                "rvc_voice": rvc_name,
-                                "pitch_semitones": 2.0,  # debe ser forzado a 0.0 para RVC
-                            })
-                            self.assertEqual(resp_tts.status_code, 200)
-                            data_tts = resp_tts.json()
-                            self.assertEqual(data_tts["status"], "ok")
-                            self.assertEqual(data_tts["engine"], "piper+rvc")
-                            self.assertEqual(data_tts["voice"], "piper_f")
-                            wav_bytes = base64.b64decode(data_tts["audio_base64"])
-                            sr, frames = get_wav_info(wav_bytes)
-                            self.assertEqual(data_tts["sample_rate"], sr)
-                            self.assertGreater(frames, 1000)
-                            self.assertEqual(mock_rvc.call_args[1].get("pitch_semitones", 0.0), 0.0)
-
-                            # 2. Endpoint /v1/audio/speech pasando el nombre del modelo RVC directamente en 'voice'
-                            resp_speech = self.client.post("/v1/audio/speech", json={
-                                "input": f"Probando voz directa {rvc_name} sobre motor Piper.",
-                                "model": "piper",
-                                "voice": rvc_name,
-                                "pitch_semitones": 2.0,  # debe ser forzado a 0.0 para RVC
-                            })
-                            self.assertEqual(resp_speech.status_code, 200)
-                            self.assertEqual(resp_speech.headers.get("X-TTS-Engine"), "piper+rvc")
-                            self.assertEqual(resp_speech.headers.get("X-TTS-Voice"), "piper_f")
-                            sr_sp, frames_sp = get_wav_info(resp_speech.content)
-                            self.assertGreater(sr_sp, 0)
-                            self.assertGreater(frames_sp, 1000)
-                            self.assertEqual(mock_rvc.call_args[1].get("pitch_semitones", 0.0), 0.0)
+        self.assertIn("piper_f", voice_ids)
 
 
 if __name__ == "__main__":
