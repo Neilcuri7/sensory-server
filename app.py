@@ -76,11 +76,35 @@ async def lifespan(app: FastAPI):
     logger.info("Deteniendo Sensory Server...")
 
 
+openapi_tags = [
+    {
+        "name": "Audio V1",
+        "description": "Endpoints canónicos v1 para procesamiento de audio: STT (Speech-to-Text) y TTS (Text-to-Speech).",
+    },
+    {
+        "name": "Vision",
+        "description": "Inspección visual y localización de elementos UI.",
+    },
+    {
+        "name": "OCR",
+        "description": "Extracción de texto y UI grounding con RapidOCR ONNX.",
+    },
+    {
+        "name": "Legacy (Deprecated)",
+        "description": "Endpoints heredados mantenidos por compatibilidad hacia atrás (/stt, /tts, etc.). Migrar a /v1/audio/*.",
+    },
+    {
+        "name": "Health",
+        "description": "Diagnóstico y verificación de estado en tiempo real.",
+    },
+]
+
 app = FastAPI(
     title="Sensory Server",
     version="3.0.0",
-    description="Servidor unificado de percepción sensorial: Voz, Oídos, Visión y OCR.",
-    lifespan=lifespan
+    description="Servidor unificado de percepción sensorial: Voz, Oídos, Visión y OCR con versionado canónico /v1/.",
+    openapi_tags=openapi_tags,
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -99,7 +123,7 @@ app.include_router(vision_router)
 app.include_router(ocr_router)
 
 
-@app.get("/health")
+@app.get("/health", tags=["Health"])
 async def health_check(request: Request):
     stt_engine = get_stt_engine(request.app)
     tts_engine = get_tts_engine(request.app)

@@ -18,7 +18,7 @@ from adapters.stt.sherpa_whisper import SherpaWhisperAdapter
 from domain.ports.speech_to_text import ISpeechToTextEngine
 
 logger = logging.getLogger("Sensory.STT")
-router = APIRouter(tags=["STT"])
+router = APIRouter()
 
 _default_engine: Optional[ISpeechToTextEngine] = None
 
@@ -64,7 +64,13 @@ class TranscriptionResponse(BaseModel):
     text: str
 
 
-@router.post("/v1/audio/transcriptions", response_model=TranscriptionResponse)
+@router.post(
+    "/v1/audio/transcriptions",
+    response_model=TranscriptionResponse,
+    tags=["Audio V1"],
+    summary="Transcribe Audio File (OpenAI standard)",
+    description="Standard multipart/form-data audio file transcription compatible with OpenAI Audio API.",
+)
 async def transcribe_audio(
     request: Request,
     file: UploadFile = File(...),
@@ -107,7 +113,19 @@ class STTJsonRequest(BaseModel):
     language: Optional[str] = "es"
 
 
-@router.post("/stt")
+@router.post(
+    "/v1/audio/transcribe-json",
+    tags=["Audio V1"],
+    summary="Transcribe Base64 JSON Audio (V1)",
+    description="Canonical V1 endpoint for transcribing base64-encoded audio within a JSON payload.",
+)
+@router.post(
+    "/stt",
+    deprecated=True,
+    tags=["Legacy (Deprecated)"],
+    summary="Transcribe Base64 JSON Audio (Deprecated)",
+    description="Deprecated alias for /v1/audio/transcribe-json. Maintained for backward compatibility.",
+)
 async def transcribe_json(req: STTJsonRequest, request: Request):
     """JSON Base64-based transcription endpoint."""
     raw_b64 = req.audio_base64

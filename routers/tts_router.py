@@ -15,7 +15,7 @@ from adapters.tts.piper_engine import PiperEngine
 from domain.ports.text_to_speech import ITextToSpeechEngine
 
 logger = logging.getLogger("Sensory.TTS")
-router = APIRouter(tags=["TTS"])
+router = APIRouter()
 
 _default_engine: Optional[ITextToSpeechEngine] = None
 
@@ -53,8 +53,19 @@ class AbortRequest(BaseModel):
     generation_id: Optional[str] = None
 
 
-@router.post("/v1/audio/speech")
-@router.post("/tts")
+@router.post(
+    "/v1/audio/speech",
+    tags=["Audio V1"],
+    summary="Synthesize Speech (PCM 22,050 Hz)",
+    description="Synthesize 16-bit linear PCM audio at 22,050 Hz (audio/pcm) using local Piper ONNX engine.",
+)
+@router.post(
+    "/tts",
+    deprecated=True,
+    tags=["Legacy (Deprecated)"],
+    summary="Synthesize Speech (Deprecated)",
+    description="Deprecated alias for /v1/audio/speech. Maintained for backward compatibility.",
+)
 async def generate_speech(req: SpeechRequest, request: Request):
     """Synthesize speech returning pure 16-bit linear PCM at 22,050 Hz."""
     text = (req.input or req.text or "").strip()
@@ -92,8 +103,19 @@ async def generate_speech(req: SpeechRequest, request: Request):
     )
 
 
-@router.post("/v1/audio/speech/abort")
-@router.post("/tts/abort")
+@router.post(
+    "/v1/audio/speech/abort",
+    tags=["Audio V1"],
+    summary="Abort Speech Synthesis",
+    description="Abort in-flight or queued synthesis tasks matching generation_id.",
+)
+@router.post(
+    "/tts/abort",
+    deprecated=True,
+    tags=["Legacy (Deprecated)"],
+    summary="Abort Speech Synthesis (Deprecated)",
+    description="Deprecated alias for /v1/audio/speech/abort. Maintained for backward compatibility.",
+)
 async def abort_speech(
     request: Request,
     req: Optional[AbortRequest] = None,
@@ -109,8 +131,19 @@ async def abort_speech(
     return {"status": "ok", "aborted": gen_id}
 
 
-@router.get("/v1/audio/voices")
-@router.get("/tts/voices")
+@router.get(
+    "/v1/audio/voices",
+    tags=["Audio V1"],
+    summary="List Voice Catalog",
+    description="Return voice catalog and active TTS synthesis engine.",
+)
+@router.get(
+    "/tts/voices",
+    deprecated=True,
+    tags=["Legacy (Deprecated)"],
+    summary="List Voice Catalog (Deprecated)",
+    description="Deprecated alias for /v1/audio/voices. Maintained for backward compatibility.",
+)
 async def list_voices():
     """List available voices and default synthesis engine."""
     return {

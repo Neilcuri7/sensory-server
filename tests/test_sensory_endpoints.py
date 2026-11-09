@@ -190,7 +190,7 @@ class TestSensoryEndpoints(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
 
     def test_stt_json_endpoint(self):
-        """Verify POST /stt accepts base64 audio and returns transcription."""
+        """Verify POST /v1/audio/transcribe-json and legacy POST /stt accept base64 audio and return transcription."""
         pcm_bytes = b"\x00\x00" * 4000
         b64_audio = base64.b64encode(pcm_bytes).decode("ascii")
 
@@ -201,22 +201,82 @@ class TestSensoryEndpoints(unittest.TestCase):
         )
 
         with patch.object(stt_router, "get_stt_engine", return_value=mock_engine):
-            response = self.client.post("/stt", json={"audio_base64": b64_audio, "sample_rate": 16000})
-            self.assertEqual(response.status_code, 200)
-            data = response.json()
-            self.assertEqual(data["status"], "ok")
-            self.assertEqual(data["text"], "Prueba JSON STT")
-            self.assertTrue(data["is_speech"])
+            # 1. Canonical /v1/audio/transcribe-json
+            response_v1 = self.client.post(
+                "/v1/audio/transcribe-json",
+                json={"audio_base64": b64_audio, "sample_rate": 16000},
+            )
+            self.assertEqual(response_v1.status_code, 200)
+            data_v1 = response_v1.json()
+            self.assertEqual(data_v1["status"], "ok")
+            self.assertEqual(data_v1["text"], "Prueba JSON STT")
+            self.assertTrue(data_v1["is_speech"])
+
+            # 2. Backward-compatible legacy alias /stt
+            response_legacy = self.client.post(
+                "/stt",
+                json={"audio_base64": b64_audio, "sample_rate": 16000},
+            )
+            self.assertEqual(response_legacy.status_code, 200)
+            data_legacy = response_legacy.json()
+            self.assertEqual(data_legacy["status"], "ok")
+            self.assertEqual(data_legacy["text"], "Prueba JSON STT")
+            self.assertTrue(data_legacy["is_speech"])
 
     def test_voices_endpoint_returns_piper(self):
-        """Verify GET /v1/audio/voices exposes Piper default voice."""
-        response = self.client.get("/v1/audio/voices")
-        self.assertEqual(response.status_code, 200)
-        data = response.json()
-        self.assertEqual(data["default_engine"], "piper")
-        self.assertEqual(data["default_voice"], "piper_f")
-        voice_ids = [v["id"] for v in data["voices"]]
-        self.assertIn("piper_f", voice_ids)
+        """Verify GET /v1/audio/voices and legacy GET /tts/voices expose Piper default voice."""
+        # 1. Canonical /v1/audio/voices
+        response_v1 = self.client.get("/v1/audio/voices")
+        self.assertEqual(response_v1.status_code, 200)
+        data_v1 = response_v1.json()
+        self.assertEqual(data_v1["default_engine"], "piper")
+        self.assertEqual(data_v1["default_voice"], "piper_f")
+        voice_ids_v1 = [v["id"] for v in data_v1["voices"]]
+        self.assertIn("piper_f", voice_ids_v1)
+
+        # 2. Backward-compatible legacy alias /tts/voices
+        response_legacy = self.client.get("/tts/voices")
+        self.assertEqual(response_legacy.status_code, 200)
+        data_legacy = response_legacy.json()
+        self.assertEqual(data_legacy["default_engine"], "piper")
+        self.assertEqual(data_legacy["default_voice"], "piper_f")
+        self.assertEqual(data_legacy, data_v1)
+
+    def test_openapi_versioning_and_deprecation_metadata(self):
+        """Verify OpenAPI spec tags canonical /v1/audio routes and marks legacy routes deprecated."""
+        schema = app.openapi()
+        paths = schema.get("paths", {})
+
+        # Canonical endpoints check
+        canonical_expectations = {
+            "/v1/audio/speech": "post",
+            "/v1/audio/speech/abort": "post",
+            "/v1/audio/voices": "get",
+            "/v1/audio/transcriptions": "post",
+            "/v1/audio/transcribe-json": "post",
+        }
+        for path, method in canonical_expectations.items():
+            self.assertIn(path, paths, f"Canonical path {path} missing from OpenAPI schema")
+            op = paths[path].get(method, {})
+            self.assertFalse(op.get("deprecated", False), f"{path} should NOT be marked deprecated")
+            self.assertIn("Audio V1", op.get("tags", []), f"{path} should be tagged 'Audio V1'")
+
+        # Legacy endpoints check
+        legacy_expectations = {
+            "/tts": "post",
+            "/tts/abort": "post",
+            "/tts/voices": "get",
+            "/stt": "post",
+        }
+        for path, method in legacy_expectations.items():
+            self.assertIn(path, paths, f"Legacy path {path} missing from OpenAPI schema")
+            op = paths[path].get(method, {})
+            self.assertTrue(op.get("deprecated", False), f"Legacy path {path} MUST be marked deprecated")
+            self.assertIn(
+                "Legacy (Deprecated)",
+                op.get("tags", []),
+                f"Legacy path {path} MUST be tagged 'Legacy (Deprecated)'",
+            )
 
 
 if __name__ == "__main__":
