@@ -158,4 +158,4 @@ if __name__ == "__main__":
     port = int(os.getenv("SENSORY_PORT", os.getenv("AOI_SENSORY_PORT", "8888")))
     host = os.getenv("SENSORY_HOST", os.getenv("AOI_SENSORY_HOST", "0.0.0.0"))
     logger.info(f"Iniciando Sensory Server en {host}:{port}")
-    uvicorn.run("app:app", host=host, port=port, reload=False)
+    uvicorn.run("app:app", host=host, port=port, reload=False, timeout_keep_alive=40)
