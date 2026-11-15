@@ -1,0 +1,65 @@
+{
+  "project": "sensory-server",
+  "features": [
+    {
+      "id": "SS-001",
+      "name": "Health + request-id middleware",
+      "description": "Health + request-id middleware",
+      "priority": 1,
+      "dependencies": [],
+      "verification": [
+        "nix-shell shell.nix --run 'python -m pytest tests/test_sensory_endpoints.py -q -k \"health_check or request_logging\"'"
+      ],
+      "status": "in-progress",
+      "evidence": "2026-11-15T23:14:44Z exit=0 commit=8478462 cmds=1 tail: .venv/lib/python3.12/site-packages/fastapi/testclient.py:1 /   /home/rylai/Documents/proyectos/pet/services/sensory-server/.venv/lib/python3.12/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead. /     from starlette.testclient import TestClient as TestClient  # noqa / -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html / 23 passed, 1 warning in 44.02s",
+      "testedAt": "2026-11-15T23:14:44Z",
+      "attempts": 0,
+      "last_failure": ""
+    },
+    {
+      "id": "SS-002",
+      "name": "TTS Piper PCM (+ legacy alias, abort, voices)",
+      "description": "TTS Piper PCM (+ legacy alias, abort, voices)",
+      "priority": 2,
+      "dependencies": [],
+      "verification": [
+        "nix-shell shell.nix --run 'python -m pytest tests/test_sensory_endpoints.py -q -k \"speech or tts_legacy or voices\"'"
+      ],
+      "status": "in-progress",
+      "evidence": "2026-11-15T23:15:58Z exit=0 commit=8478462 cmds=1 tail: .venv/lib/python3.12/site-packages/fastapi/testclient.py:1 /   /home/rylai/Documents/proyectos/pet/services/sensory-server/.venv/lib/python3.12/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead. /     from starlette.testclient import TestClient as TestClient  # noqa / -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html / 23 passed, 1 warning in 46.52s",
+      "testedAt": "2026-11-15T23:15:58Z",
+      "attempts": 0,
+      "last_failure": ""
+    },
+    {
+      "id": "SS-003",
+      "name": "STT transcriptions",
+      "description": "STT transcriptions",
+      "priority": 3,
+      "dependencies": [],
+      "verification": [
+        "nix-shell shell.nix --run 'python -m pytest tests/test_sensory_endpoints.py -q -k \"transcriptions or stt_json\"'"
+      ],
+      "status": "in-progress",
+      "evidence": "2026-11-15T23:17:11Z exit=0 commit=8478462 cmds=1 tail: .venv/lib/python3.12/site-packages/fastapi/testclient.py:1 /   /home/rylai/Documents/proyectos/pet/services/sensory-server/.venv/lib/python3.12/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead. /     from starlette.testclient import TestClient as TestClient  # noqa / -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html / 23 passed, 1 warning in 46.75s",
+      "testedAt": "2026-11-15T23:17:11Z",
+      "attempts": 0,
+      "last_failure": ""
+    },
+    {
+      "id": "SS-004",
+      "name": "v1 OpenAPI contract / deprecation",
+      "description": "v1 OpenAPI contract / deprecation",
+      "priority": 4,
+      "dependencies": [],
+      "verification": [
+        "nix-shell shell.nix --run 'python -m pytest tests/test_sensory_endpoints.py -q -k \"openapi_versioning\"'"
+      ],
+      "status": "in-progress",
+      "evidence": "2026-11-15T23:18:21Z exit=0 commit=8478462 cmds=1 tail: .venv/lib/python3.12/site-packages/fastapi/testclient.py:1 /   /home/rylai/Documents/proyectos/pet/services/sensory-server/.venv/lib/python3.12/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead. /     from starlette.testclient import TestClient as TestClient  # noqa / -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html / 23 passed, 1 warning in 43.12s",
+      "testedAt": "2026-11-15T23:18:21Z",
+      "attempts": 0,
+      "last_failure": ""
+    }
+  ]
+}
